@@ -1,0 +1,3 @@
+version = "8.7.0"
+revision = "aad3edd370955449717a334f0289dee10e2c5f01"
+repository = "https://github.com/limine-bootloader/limine.git"

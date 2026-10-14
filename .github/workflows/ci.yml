@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+      - name: Install image and emulator tools
+        run: sudo apt-get update && sudo apt-get install -y xorriso qemu-system-x86 ovmf
+      - name: Check source, host tests, kernel and publication policy
+        run: cargo xtask check
+      - name: Check repository history
+        run: python3 tools/audit_repo.py --staged --history
+      - name: Fetch pinned bootloader
+        run: cargo xtask fetch-bootloader
+      - name: BIOS boot
+        run: cargo xtask smoke
+      - name: UEFI boot
+        env:
+          ARKHE_OVMF: /usr/share/OVMF/OVMF_CODE_4M.fd
+          ARKHE_OVMF_VARS: /usr/share/OVMF/OVMF_VARS_4M.fd
+        run: cargo xtask smoke

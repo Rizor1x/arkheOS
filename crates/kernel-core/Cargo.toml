@@ -1,0 +1,12 @@
+[package]
+name = "arkhe-kernel-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+arkhe-abi = { path = "../abi" }
+
+[lints]
+workspace = true

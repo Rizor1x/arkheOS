@@ -1,0 +1,27 @@
+[workspace]
+members = ["kernel", "crates/kernel-core", "crates/abi", "xtask"]
+default-members = ["crates/kernel-core", "crates/abi", "xtask"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+overflow-checks = true
+debug = 1

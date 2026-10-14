@@ -1,0 +1,24 @@
+[package]
+name = "arkhe-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+limine = "=0.5.0"
+arkhe-abi = { path = "../crates/abi" }
+arkhe-kernel-core = { path = "../crates/kernel-core" }
+
+[features]
+smoke = []
+
+[[bin]]
+name = "arkhe-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[lints]
+workspace = true
