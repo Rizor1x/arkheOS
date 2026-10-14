@@ -42,6 +42,9 @@ EXCEPTION 28
 EXCEPTION 29, 1
 EXCEPTION 30, 1
 EXCEPTION 31
+EXCEPTION 32
+EXCEPTION 39
+EXCEPTION 47
 EXCEPTION 128
 
 .global arkhe_unexpected_entry
@@ -71,6 +74,9 @@ arkhe_exception_common:
     and rsp, -16
     call arkhe_exception_dispatch
     mov rsp, rbx
+
+.global arkhe_restore_context
+arkhe_restore_context:
     pop r15
     pop r14
     pop r13

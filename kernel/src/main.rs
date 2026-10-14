@@ -9,7 +9,6 @@ use arch::x86_64 as cpu;
 use arkhe_abi::{Error, Message};
 use arkhe_kernel_core::capability::{CapabilityTable, ObjectId, Rights};
 use arkhe_kernel_core::ipc::MessageQueue;
-use arkhe_kernel_core::memory::FrameAllocator;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -21,7 +20,6 @@ pub extern "C" fn _start() -> ! {
         boot::BootError::InvalidRegion(reason) => panic!("invalid memory region: {reason:?}"),
         _ => panic!("boot protocol: {error:?}"),
     });
-    let mut frames = FrameAllocator::new(memory.ranges()).expect("invalid usable memory map");
     cpu::write_console(format_args!(
         "memory: {} regions, HHDM {:#x}\n",
         memory.ranges().len(),
@@ -45,7 +43,7 @@ pub extern "C" fn _start() -> ! {
     let executable =
         arkhe_kernel_core::elf::Executable::parse(archive.read("bin/init").expect("bin/init"))
             .expect("invalid init ELF");
-    user::launch(&mut frames, memory.direct_map_offset, &executable);
+    user::launch(memory.ranges(), memory.direct_map_offset, executable);
 }
 
 fn check_core() -> Result<(), Error> {

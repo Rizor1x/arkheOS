@@ -1,6 +1,7 @@
 pub mod exceptions;
 pub mod paging;
 mod serial;
+pub mod timer;
 
 pub use serial::{init_console, write_console};
 
@@ -24,4 +25,14 @@ pub fn exit_test(code: u32) -> ! {
         core::arch::asm!("out dx, eax", in("dx") 0xf4_u16, in("eax") code, options(nomem, nostack));
     }
     halt()
+}
+
+pub fn idle() -> ! {
+    loop {
+        // SAFETY: All tasks have exited; the installed timer gate acknowledges IRQs.
+        // STI's interrupt shadow makes HLT atomic with respect to pending interrupts.
+        unsafe {
+            core::arch::asm!("sti", "hlt", options(nomem, nostack));
+        }
+    }
 }

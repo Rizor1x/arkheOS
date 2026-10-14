@@ -84,7 +84,7 @@ struct Descriptors {
     gdt: [u64; 7],
     task: TaskState,
     idt: [Gate; 256],
-    stacks: [[u8; STACK_BYTES]; 5],
+    stacks: [[u8; STACK_BYTES]; 6],
 }
 
 struct DescriptorStorage(UnsafeCell<Descriptors>);
@@ -97,7 +97,7 @@ static STORAGE: DescriptorStorage = DescriptorStorage(UnsafeCell::new(Descriptor
     gdt: [0; 7],
     task: TaskState::EMPTY,
     idt: [Gate::EMPTY; 256],
-    stacks: [[0; STACK_BYTES]; 5],
+    stacks: [[0; STACK_BYTES]; 6],
 }));
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -105,6 +105,9 @@ unsafe extern "C" {
     static arkhe_exception_entries: [usize; 32];
     fn arkhe_unexpected_entry();
     fn arkhe_exception_128();
+    fn arkhe_exception_32();
+    fn arkhe_exception_39();
+    fn arkhe_exception_47();
 }
 
 const _: () = assert!(core::mem::size_of::<Gate>() == 16);
@@ -156,6 +159,13 @@ pub fn init() {
         };
         tables.idt[vector] = Gate::new(*address, stack);
     }
+    for (vector, address) in [
+        (32, arkhe_exception_32 as *const () as usize),
+        (39, arkhe_exception_39 as *const () as usize),
+        (47, arkhe_exception_47 as *const () as usize),
+    ] {
+        tables.idt[vector] = Gate::new(address, 6);
+    }
     tables.idt[128] = Gate::new(arkhe_exception_128 as *const () as usize, 5);
     tables.idt[128].attributes = 0xee;
     let gdt = TablePointer {
@@ -179,6 +189,7 @@ pub fn init() {
     }
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct ExceptionFrame {
     registers: [u64; 15],
@@ -191,15 +202,63 @@ pub struct ExceptionFrame {
     stack_segment: u64,
 }
 
+const _: () = assert!(core::mem::size_of::<ExceptionFrame>() == 22 * 8);
+
+impl ExceptionFrame {
+    pub const EMPTY: Self = Self {
+        registers: [0; 15],
+        vector: 0,
+        error: 0,
+        instruction: 0,
+        code_segment: 35,
+        flags: 0x202,
+        stack_pointer: 0,
+        stack_segment: 27,
+    };
+
+    pub fn user(entry: u64, stack: u64, console: u64, role: u64) -> Self {
+        let mut frame = Self {
+            instruction: entry,
+            stack_pointer: stack,
+            ..Self::EMPTY
+        };
+        frame.registers[8] = console;
+        frame.registers[9] = role;
+        frame
+    }
+
+    pub fn arguments(&self) -> [u64; 4] {
+        [
+            self.registers[14],
+            self.registers[8],
+            self.registers[9],
+            self.registers[12],
+        ]
+    }
+
+    pub fn result(&mut self, value: i64) {
+        self.registers[14] = value as u64;
+    }
+    pub fn is_user(&self) -> bool {
+        self.code_segment & 3 == 3
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn arkhe_exception_dispatch(frame: &mut ExceptionFrame) {
-    if frame.vector == 128 && frame.code_segment & 3 == 3 {
-        frame.registers[14] = crate::user::syscall([
-            frame.registers[14],
-            frame.registers[8],
-            frame.registers[9],
-            frame.registers[12],
-        ]) as u64;
+    if frame.vector == 32 {
+        super::timer::tick();
+        if frame.is_user() {
+            crate::user::preempt(frame);
+        }
+        return;
+    }
+    if matches!(frame.vector, 39 | 47) {
+        super::timer::spurious(frame.vector);
+        return;
+    }
+    if frame.vector == 128 && frame.is_user() {
+        crate::user::syscall(frame);
         return;
     }
     if frame.vector == 3 {
@@ -210,8 +269,9 @@ extern "C" fn arkhe_exception_dispatch(frame: &mut ExceptionFrame) {
     unsafe {
         core::arch::asm!("mov {}, cr2", out(reg) fault_address, options(nomem, nostack));
     }
-    if frame.code_segment & 3 == 3 {
-        crate::user::fault(frame.vector, frame.error, fault_address);
+    if frame.is_user() && !matches!(frame.vector, 2 | 8 | 18) {
+        crate::user::fault(frame, frame.vector, frame.error, fault_address);
+        return;
     }
     write_console(format_args!(
         "exception: vector={} error={:#x} rip={:#x} cr2={fault_address:#x}\n",
@@ -298,7 +358,8 @@ pub fn trigger_test_fault() {
                 core::arch::asm!("mov rax, [{address}]", address = in(reg) TEST_FAULT_ADDRESS, out("rax") _);
             }
         }
-        "boot" | "user-kernel-read" | "user-cli" | "user-write-code" | "user-exec-stack" => return,
+        "idle" | "scheduler" | "user-fpu" | "boot" | "user-kernel-read" | "user-cli"
+        | "user-write-code" | "user-exec-stack" => return,
         _ => panic!("unknown fault test"),
     }
     panic!("expected CPU exception was not raised");

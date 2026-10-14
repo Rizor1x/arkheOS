@@ -14,6 +14,7 @@ pub enum Syscall {
     DebugWrite = 4,
     Exit = 5,
     Version = 6,
+    ClockTicks = 7,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -28,6 +29,7 @@ impl TryFrom<u64> for Syscall {
             4 => Ok(Self::DebugWrite),
             5 => Ok(Self::Exit),
             6 => Ok(Self::Version),
+            7 => Ok(Self::ClockTicks),
             _ => Err(Error::Unsupported),
         }
     }

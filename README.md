@@ -4,23 +4,28 @@ An experimental x86_64 operating system written in Rust. The project aims for a
 small kernel, isolated system services, native applications, and a desktop interface.
 
 The kernel boots through BIOS or UEFI, loads a static Rust ELF from a read-only
-initramfs, and executes it in ring 3. The included application exercises console
-capabilities, checked system-call buffers, and process exit.
+initramfs, and runs three isolated instances in ring 3. The startup demonstration
+exercises console capabilities, checked system-call buffers, scheduling, and process exit.
+It repeats the launch after reclaiming every process frame.
 
 Implemented:
 
 - COM1 console, GDT/TSS/IDT, and dedicated exception stacks;
-- validated usable RAM ranges and a private user page-table root;
+- validated usable RAM ranges, owned frame leases, and per-process page tables;
+- single-CPU round-robin preemption, voluntary yield, and an interrupt-driven idle path;
+- legacy PC PIC/PIT timer at approximately 100 Hz;
 - RX user code, RW/NX data and stack, and unmapped stack guard pages;
 - bounded USTAR initramfs with checked headers and indexed file lookup;
 - static ELF64 loading with segment, entry, bounds, and W^X validation;
-- version, console-write, close, and exit calls through the initial `int 0x80` ABI;
+- version, console-write, close, yield, timer-tick, and exit calls through `int 0x80`;
+- page reclamation on exit/fault and rollback of partially loaded executables;
 - host tests and real kernel/user fault injection under BIOS and UEFI QEMU.
 
-Currently one process runs on one CPU. There is no timer/preemption or frame
-reclamation; kernel higher-half mappings are inherited from Limine. General
-untrusted workloads, persistent storage, Rust `std`, Python, and a desktop are
-not supported yet. The kernel is not ready for everyday use.
+Currently the boot demonstration launches a fixed set of processes on one CPU.
+Kernel higher-half mappings are inherited from Limine; APIC, SMP, blocking IPC,
+and a general process-creation API are not implemented. Persistent storage,
+Rust `std`, Python, and a desktop are not supported yet. The kernel is experimental
+and is not ready for everyday use.
 
 ## Build and run
 
@@ -58,20 +63,29 @@ cargo xtask check
 cargo xtask smoke
 cargo xtask smoke-exceptions
 cargo xtask smoke-userspace
+cargo xtask smoke-scheduler
 ```
 
 `check` runs formatting, Clippy, host tests, kernel/application builds, and ELF
 and repository checks. `smoke` boots the kernel, runs the Rust application, and
-requires a successful exit within 30 seconds.
+requires successful exits and full frame reclamation within 30 seconds.
+Each userspace test runs two rounds with fresh address spaces. Smoke builds
+also exhaust a small frame pool during ELF loading and require complete rollback.
 
 `smoke-exceptions` raises real divide, page, and double faults. The double-fault
 handler must execute on its independent emergency stack. Every boot also checks
 register and flag restoration after a returning breakpoint.
 
 `smoke-userspace` verifies that user code cannot read mapped kernel memory,
-execute privileged instructions, write its RX code, or execute its NX stack.
+execute privileged instructions, write its RX code, execute its NX stack, or use
+unsupported x87 state. Each fault must leave the other processes running.
 The application also tests invalid/closed handles, unknown calls, pointer
 overflow, unmapped buffers, guard-page crossings, and a valid cross-page copy.
+
+`smoke-scheduler` verifies timer preemption of an application that never yields,
+GPR/flag restoration across interrupts, independent writable data, and continued
+execution of other processes. A separate case requires timer interrupts to wake
+the idle kernel after every process has exited.
 
 For UEFI, provide a matching firmware code and variables template:
 
@@ -98,7 +112,7 @@ not implemented.
 | `tools/`, `tests/` | Validation tools and their tests |
 
 The portable libraries are `no_std` and forbid unsafe code. The IPC queue is a
-kernel model; cross-process IPC and scheduling have not been implemented.
+kernel model; cross-process IPC has not been implemented.
 
 Generated files stay in `target/`, `build/`, and `.cache/`. `cargo xtask iso`
 builds `build/normal/arkheOS.iso`; each smoke case uses a separate build directory.
@@ -109,20 +123,27 @@ Local Git checks can be installed with `cargo xtask hooks`.
 ## Initial application ABI
 
 Applications are static x86_64 ELF64 executables with a Rust `no_std` runtime.
-The entry function receives its console handle in RDI. `userspace/init` provides
-a complete build and syscall example. The ABI is experimental.
+The entry function receives its console handle in RDI and the boot-demo role
+in RSI. `userspace/init` provides a complete build and syscall example. The ABI is experimental.
 
 `int 0x80` takes a call number in RAX and arguments in RDI, RSI, and RDX.
 RAX returns a nonnegative result or a negative `arkhe-abi::Error`; other GPRs are
-preserved. Floating-point/SIMD context and thread-local storage are not supported.
+preserved. Hardware floating-point/SIMD instructions trap; context saving and
+thread-local storage are not supported. Software floating point uses the bare Rust target defaults.
 
 | Call | Number | Arguments and result |
 | --- | --- | --- |
+| Yield | 0 | Gives other runnable processes a turn; returns 0 |
 | Close | 3 | Handle; returns 0 |
 | DebugWrite | 4 | Console handle, UTF-8 buffer pointer, length ≤256; returns bytes written |
 | Exit | 5 | Exit status; does not return |
 | Version | 6 | Returns `ABI_VERSION` |
+| ClockTicks | 7 | Returns the saturating count of delivered timer interrupts |
 
-Yield, Send, and Receive remain reserved and return Unsupported. The initial
-program has a 16 KiB stack. On exit or fault the kernel retains control and halts;
-launching another process and reclaiming its pages require the next lifecycle stage.
+Send and Receive remain reserved and return Unsupported. Each application has
+a 16 KiB stack. Exit and user faults release that process’s mappings after CR3
+has switched away; the remaining runnable processes continue. The frame pool
+tracks at most 4,096 frames, with at most 1,100 owned frames per address space.
+Reused pages are zeroed before loading. Timer ticks are a scheduling counter,
+not an accurate wall clock: interrupts can coalesce while the kernel masks IRQs.
+Kernel handlers run without preemption; blocking inside a syscall is not supported.

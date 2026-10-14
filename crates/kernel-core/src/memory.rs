@@ -13,6 +13,14 @@ pub struct FrameRange {
 }
 
 impl FrameRange {
+    pub const EMPTY: Self = Self { start: 0, end: 0 };
+    pub const fn start(self) -> u64 {
+        self.start
+    }
+    pub const fn end(self) -> u64 {
+        self.end
+    }
+
     pub fn from_region(base: u64, length: u64) -> Result<Self, RegionError> {
         let end = base.checked_add(length).ok_or(RegionError::Overflow)?;
         let Some(start) = base.checked_add(PAGE_SIZE - 1) else {

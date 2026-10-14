@@ -32,12 +32,12 @@ fn call(number: u64, a: u64, b: u64, c: u64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(console: u64) -> ! {
+pub extern "C" fn _start(console: u64, role: u64) -> ! {
     if BSS.load(Ordering::Relaxed) != 0 {
         exit(1);
     }
-    BSS.store(42, Ordering::Relaxed);
-    if BSS.load(Ordering::Relaxed) != 42 {
+    BSS.store(42 + role, Ordering::Relaxed);
+    if BSS.load(Ordering::Relaxed) != 42 + role {
         exit(1);
     }
     let text = b"Hello from native Rust in ring 3\n";
@@ -79,11 +79,41 @@ pub extern "C" fn _start(console: u64) -> ! {
     {
         exit(1);
     }
-    match env!("ARKHE_TEST_CASE") {
+    if env!("ARKHE_TEST_CASE") == "scheduler" {
+        if role == 0 {
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+        let start = call(Syscall::ClockTicks as u64, 0, 0, 0);
+        while call(Syscall::ClockTicks as u64, 0, 0, 0) - start < 24 {
+            check_registers();
+            if BSS.load(Ordering::Relaxed) != 42 + role {
+                exit(1);
+            }
+        }
+    }
+    for _ in 0..16 {
+        if call(Syscall::Yield as u64, 0, 0, 0) != 0 || BSS.load(Ordering::Relaxed) != 42 + role {
+            exit(1);
+        }
+    }
+    match if role == 0 {
+        env!("ARKHE_TEST_CASE")
+    } else {
+        "boot"
+    } {
         "user-kernel-read" => {
             // SAFETY: Fault injection intentionally attempts a supervisor-only read.
             unsafe {
                 core::arch::asm!("mov rax, [{address}]", address = in(reg) 0xffff_ffff_8000_0000u64, out("rax") _);
+            }
+            exit(2);
+        }
+        "user-fpu" => {
+            // SAFETY: Unsupported x87 state must trap instead of leaking across processes.
+            unsafe {
+                core::arch::asm!("fninit");
             }
             exit(2);
         }
@@ -126,6 +156,25 @@ pub extern "C" fn _start(console: u64) -> ! {
         exit(1);
     }
     exit(0)
+}
+
+fn check_registers() {
+    let valid: u64;
+    // SAFETY: The bounded loop makes no memory accesses. Timer entry must preserve
+    // callee-saved RBX, caller-saved R8/R9, the loop counter, and carry flag.
+    unsafe {
+        core::arch::asm!(
+            "push rbx", "mov rbx, 0x13579", "mov r8, 0x2468", "mov r9, 0xabcdef",
+            "mov rcx, 2000000", "stc", "2:", "dec rcx", "jnz 2b", "setc al",
+            "cmp rbx, 0x13579", "sete dl", "and al, dl",
+            "cmp r8, 0x2468", "sete dl", "and al, dl",
+            "cmp r9, 0xabcdef", "sete dl", "and al, dl", "pop rbx",
+            out("rax") valid, out("rcx") _, out("rdx") _, out("r8") _, out("r9") _,
+        );
+    }
+    if valid & 0xff != 1 {
+        exit(1);
+    }
 }
 
 fn exit(status: u64) -> ! {

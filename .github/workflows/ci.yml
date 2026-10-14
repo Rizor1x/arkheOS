@@ -31,6 +31,7 @@ jobs:
           cargo xtask smoke
           cargo xtask smoke-exceptions
           cargo xtask smoke-userspace
+          cargo xtask smoke-scheduler
       - name: UEFI kernel and userspace checks
         env:
           ARKHE_OVMF: /usr/share/OVMF/OVMF_CODE_4M.fd
@@ -39,3 +40,4 @@ jobs:
           cargo xtask smoke
           cargo xtask smoke-exceptions
           cargo xtask smoke-userspace
+          cargo xtask smoke-scheduler

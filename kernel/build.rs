@@ -8,6 +8,9 @@ fn main() {
     assert!(matches!(
         case.as_str(),
         "boot"
+            | "scheduler"
+            | "idle"
+            | "user-fpu"
             | "divide"
             | "page-fault"
             | "double-fault"

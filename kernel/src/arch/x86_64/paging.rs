@@ -1,5 +1,8 @@
 use arkhe_kernel_core::elf::Executable;
-use arkhe_kernel_core::memory::FrameAllocator;
+use arkhe_kernel_core::frame_pool::{Frame, FramePool};
+
+pub const POOL_FRAMES: usize = 4096;
+const MAX_OWNED_FRAMES: usize = 1100;
 
 const PRESENT: u64 = 1;
 const WRITE: u64 = 2;
@@ -12,7 +15,7 @@ const PAGE: u64 = 4096;
 pub const STACK_TOP: u64 = 0x7000_0000;
 const STACK_PAGES: u64 = 4;
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum MapError {
     NoMemory,
     InvalidAddress,
@@ -24,17 +27,44 @@ pub enum MapError {
 pub struct AddressSpace {
     root: u64,
     direct_map: u64,
+    owned: [Option<Frame>; MAX_OWNED_FRAMES],
+    count: usize,
 }
 
 impl AddressSpace {
+    pub const fn new() -> Self {
+        Self {
+            root: 0,
+            direct_map: 0,
+            owned: [const { None }; MAX_OWNED_FRAMES],
+            count: 0,
+        }
+    }
+
     /// # Safety
     /// The allocator must exclusively own usable RAM mapped at `direct_map` by Limine.
     /// No other CPU may change the inherited kernel mappings while this space is alive.
-    pub unsafe fn load(
-        frames: &mut FrameAllocator<'_>,
+    pub unsafe fn load<const N: usize>(
+        &mut self,
+        frames: &mut FramePool<N>,
         direct_map: u64,
         elf: &Executable<'_>,
-    ) -> Result<Self, MapError> {
+    ) -> Result<(), MapError> {
+        assert_eq!(self.count, 0, "address space already owns frames");
+        self.direct_map = direct_map;
+        // SAFETY: The caller provides exclusive usable RAM and unchanged kernel mappings.
+        let result = unsafe { self.load_inner(frames, elf) };
+        if result.is_err() {
+            self.release(frames);
+        }
+        result
+    }
+
+    unsafe fn load_inner<const N: usize>(
+        &mut self,
+        frames: &mut FramePool<N>,
+        elf: &Executable<'_>,
+    ) -> Result<(), MapError> {
         let old_root: u64;
         let control: u64;
         // SAFETY: Ring 0 reads CR3/CR4; the active root is retained by Limine.
@@ -42,29 +72,60 @@ impl AddressSpace {
             core::arch::asm!("mov {}, cr3", out(reg) old_root, options(nomem, nostack));
             core::arch::asm!("mov {}, cr4", out(reg) control, options(nomem, nostack));
         }
-        if control & (1 << 12) != 0 || direct_map & (PAGE - 1) != 0 {
+        if control & (1 << 12) != 0 || self.direct_map & (PAGE - 1) != 0 {
             return Err(MapError::InvalidAddress);
         }
         enable_protection();
-        let root = next_frame(frames)?;
-        let mut space = Self { root, direct_map };
-        space.zero(root)?;
+        let root = self.allocate(frames)?;
+        self.root = root;
+        self.zero(root)?;
         for index in 256..512 {
-            let value = space.read_entry(old_root & ADDRESS, index)? & !USER;
-            space.write_entry(root, index, value)?;
+            let value = self.read_entry(old_root & ADDRESS, index)? & !USER;
+            self.write_entry(root, index, value)?;
         }
         for segment in elf.segments() {
             let start = segment.address & !(PAGE - 1);
             let end = (segment.address + segment.memory_size + PAGE - 1) & !(PAGE - 1);
             for virtual_page in (start..end).step_by(PAGE as usize) {
-                space.map(frames, virtual_page, segment.writable, segment.executable)?;
+                self.map(frames, virtual_page, segment.writable, segment.executable)?;
             }
-            space.copy_into(segment.address, segment.data)?;
+            self.copy_into(segment.address, segment.data)?;
         }
         for page in (STACK_TOP - STACK_PAGES * PAGE..STACK_TOP).step_by(PAGE as usize) {
-            space.map(frames, page, true, false)?;
+            self.map(frames, page, true, false)?;
         }
-        Ok(space)
+        Ok(())
+    }
+
+    /// Switch CR3 away from this root before returning any of its frames.
+    pub fn release<const N: usize>(&mut self, frames: &mut FramePool<N>) {
+        assert_ne!(
+            active_root(),
+            self.root,
+            "cannot release the active address space"
+        );
+        for frame in self.owned[..self.count].iter_mut() {
+            frames
+                .release(frame.take().expect("owned frame"))
+                .expect("frame ownership");
+        }
+        self.count = 0;
+        self.root = 0;
+    }
+
+    fn allocate<const N: usize>(&mut self, frames: &mut FramePool<N>) -> Result<u64, MapError> {
+        if self.count == self.owned.len() {
+            return Err(MapError::NoMemory);
+        }
+        let frame = frames.allocate().ok_or(MapError::NoMemory)?;
+        let physical = frame.physical();
+        if physical == 0 || physical & !ADDRESS != 0 {
+            frames.release(frame).expect("rejected frame ownership");
+            return Err(MapError::InvalidAddress);
+        }
+        self.owned[self.count] = Some(frame);
+        self.count += 1;
+        Ok(physical)
     }
 
     pub fn root(&self) -> u64 {
@@ -97,9 +158,9 @@ impl AddressSpace {
         Ok(())
     }
 
-    fn map(
+    fn map<const N: usize>(
         &mut self,
-        frames: &mut FrameAllocator<'_>,
+        frames: &mut FramePool<N>,
         address: u64,
         writable: bool,
         executable: bool,
@@ -115,7 +176,7 @@ impl AddressSpace {
             let index = ((address >> shift) & 511) as usize;
             let mut entry = self.read_entry(table, index)?;
             if entry & PRESENT == 0 {
-                let frame = next_frame(frames)?;
+                let frame = self.allocate(frames)?;
                 self.zero(frame)?;
                 entry = frame | PRESENT | WRITE | USER;
                 self.write_entry(table, index, entry)?;
@@ -129,7 +190,7 @@ impl AddressSpace {
         if self.read_entry(table, index)? & PRESENT != 0 {
             return Err(MapError::AlreadyMapped);
         }
-        let frame = next_frame(frames)?;
+        let frame = self.allocate(frames)?;
         self.zero(frame)?;
         let flags =
             PRESENT | USER | if writable { WRITE } else { 0 } | if executable { 0 } else { NX };
@@ -208,15 +269,6 @@ impl AddressSpace {
     }
 }
 
-fn next_frame(frames: &mut FrameAllocator<'_>) -> Result<u64, MapError> {
-    loop {
-        let frame = frames.allocate().ok_or(MapError::NoMemory)?;
-        if frame != 0 && frame & !ADDRESS == 0 {
-            return Ok(frame);
-        }
-    }
-}
-
 fn enable_protection() {
     let extended = core::arch::x86_64::__cpuid(0x8000_0000);
     assert!(extended.eax >= 0x8000_0001, "extended CPUID unavailable");
@@ -228,12 +280,30 @@ fn enable_protection() {
     let low: u32;
     let high: u32;
     // SAFETY: EFER exists in long mode. Enabling NX is supported by checked CPUID;
-    // CR0.WP enforces supervisor write protection. Clearing PGE prevents stale
-    // global lower-half translations from surviving the upcoming CR3 switch.
+    // CR0.WP enforces supervisor write protection. EM/TS trap unsupported FP/SIMD.
+    // Clearing PGE prevents stale global lower-half translations from surviving the upcoming CR3 switch.
     unsafe {
         core::arch::asm!("rdmsr", in("ecx") 0xc0000080u32, out("eax") low, out("edx") high);
         core::arch::asm!("wrmsr", in("ecx") 0xc0000080u32, in("eax") low | (1 << 11), in("edx") high);
-        core::arch::asm!("mov rax, cr0", "or rax, 0x10000", "mov cr0, rax",
+        core::arch::asm!("mov rax, cr0", "or rax, 0x1000c", "mov cr0, rax",
             "mov rax, cr4", "and rax, -129", "mov cr4, rax", out("rax") _);
+    }
+}
+
+pub fn active_root() -> u64 {
+    let root: u64;
+    // SAFETY: Only ring 0 calls this function; reading CR3 does not change mappings.
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) root, options(nomem, nostack));
+    }
+    root & ADDRESS
+}
+
+/// # Safety
+/// The root must retain the running kernel, its stack, and all global kernel state.
+pub unsafe fn switch(root: u64) {
+    // SAFETY: The caller guarantees shared supervisor mappings; IRQs remain masked.
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack));
     }
 }
