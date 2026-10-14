@@ -42,6 +42,7 @@ EXCEPTION 28
 EXCEPTION 29, 1
 EXCEPTION 30, 1
 EXCEPTION 31
+EXCEPTION 128
 
 .global arkhe_unexpected_entry
 arkhe_unexpected_entry:

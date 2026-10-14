@@ -3,6 +3,7 @@
 
 mod arch;
 mod boot;
+mod user;
 
 use arch::x86_64 as cpu;
 use arkhe_abi::{Error, Message};
@@ -21,9 +22,8 @@ pub extern "C" fn _start() -> ! {
         _ => panic!("boot protocol: {error:?}"),
     });
     let mut frames = FrameAllocator::new(memory.ranges()).expect("invalid usable memory map");
-    let first = frames.allocate().expect("no usable physical frames");
     cpu::write_console(format_args!(
-        "memory: {} regions, first frame {first:#x}, HHDM {:#x}\n",
+        "memory: {} regions, HHDM {:#x}\n",
         memory.ranges().len(),
         memory.direct_map_offset
     ));
@@ -35,10 +35,17 @@ pub extern "C" fn _start() -> ! {
     #[cfg(feature = "smoke")]
     cpu::exceptions::trigger_test_fault();
     cpu::write_console(format_args!("ARKHE_BOOT_OK\n"));
-    #[cfg(feature = "smoke")]
-    cpu::exit_test(0x10);
-    #[cfg(not(feature = "smoke"))]
-    cpu::halt();
+    let archive =
+        arkhe_kernel_core::initramfs::Archive::new(boot::initramfs().expect("initramfs module"))
+            .expect("invalid initramfs");
+    cpu::write_console(format_args!(
+        "initramfs: {} files, indexed read-only\n",
+        archive.file_count()
+    ));
+    let executable =
+        arkhe_kernel_core::elf::Executable::parse(archive.read("bin/init").expect("bin/init"))
+            .expect("invalid init ELF");
+    user::launch(&mut frames, memory.direct_map_offset, &executable);
 }
 
 fn check_core() -> Result<(), Error> {

@@ -1,7 +1,9 @@
 use arkhe_kernel_core::memory::{FrameRange, RegionError};
 use limine::BaseRevision;
 use limine::memory_map::EntryType;
-use limine::request::{HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::request::{
+    HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker,
+};
 
 pub const MAX_REGIONS: usize = 128;
 
@@ -17,6 +19,9 @@ static MEMORY: MemoryMapRequest = MemoryMapRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static HHDM: HhdmRequest = HhdmRequest::new();
+#[used]
+#[unsafe(link_section = ".requests")]
+static MODULES: ModuleRequest = ModuleRequest::new();
 #[used]
 #[unsafe(link_section = ".requests_end_marker")]
 static END: RequestsEndMarker = RequestsEndMarker::new();
@@ -34,6 +39,31 @@ pub enum BootError {
     MissingDirectMap,
     TooManyRegions,
     InvalidRegion(RegionError),
+    MissingInitramfs,
+    InvalidInitramfs,
+}
+
+pub fn initramfs() -> Result<&'static [u8], BootError> {
+    let modules = MODULES
+        .get_response()
+        .ok_or(BootError::MissingInitramfs)?
+        .modules();
+    if modules.len() != 1 {
+        return Err(BootError::InvalidInitramfs);
+    }
+    let module = modules[0];
+    let size = usize::try_from(module.size()).map_err(|_| BootError::InvalidInitramfs)?;
+    if module.string().to_bytes() != b"initramfs"
+        || size == 0
+        || size > 16 * 1024 * 1024
+        || module.addr().is_null()
+        || (module.addr() as usize).checked_add(size).is_none()
+    {
+        return Err(BootError::InvalidInitramfs);
+    }
+    // SAFETY: Limine owns this immutable module mapping for the boot lifetime.
+    // Its pages are not USABLE RAM; the allocator cannot reuse them. Length is bounded.
+    Ok(unsafe { core::slice::from_raw_parts(module.addr(), size) })
 }
 
 impl BootMemory {

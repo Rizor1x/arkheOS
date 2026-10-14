@@ -11,6 +11,9 @@ pub enum Syscall {
     Send = 1,
     Receive = 2,
     Close = 3,
+    DebugWrite = 4,
+    Exit = 5,
+    Version = 6,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -22,6 +25,9 @@ impl TryFrom<u64> for Syscall {
             1 => Ok(Self::Send),
             2 => Ok(Self::Receive),
             3 => Ok(Self::Close),
+            4 => Ok(Self::DebugWrite),
+            5 => Ok(Self::Exit),
+            6 => Ok(Self::Version),
             _ => Err(Error::Unsupported),
         }
     }

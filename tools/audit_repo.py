@@ -12,7 +12,7 @@ ROOT_FILES = {
     "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "README.md",
     "LICENSE", ".gitignore", ".editorconfig",
 }
-SOURCE_DIRS = {"kernel", "crates", "xtask", "boot", "tools", "tests"}
+SOURCE_DIRS = {"kernel", "crates", "userspace", "xtask", "boot", "tools", "tests"}
 SUFFIXES = {".rs", ".S", ".toml", ".py", ".ld", ".conf", ".lock"}
 FORBIDDEN_DIRS = {
     "target", "build", "dist", "vendor", "iso_root", "bootloader", ".cache", ".local",

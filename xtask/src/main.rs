@@ -26,7 +26,7 @@ fn dispatch() -> Result {
     match task {
         "help" if args.len() <= 1 => {
             println!(
-                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|audit|hooks|doctor>"
+                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|smoke-userspace|audit|hooks|doctor>"
             );
             Ok(())
         }
@@ -36,7 +36,18 @@ fn dispatch() -> Result {
         "fetch-bootloader" => fetch_bootloader(),
         "iso" => iso(false, "boot").map(|_| ()),
         "run" => run_qemu(),
-        "smoke" => smoke("boot", "ARKHE_BOOT_OK"),
+        "smoke" => smoke("boot", "ARKHE_USER_OK"),
+        "smoke-userspace" => {
+            for (case, marker) in [
+                ("user-kernel-read", "ARKHE_USER_KERNEL_READ_OK"),
+                ("user-cli", "ARKHE_USER_CLI_OK"),
+                ("user-write-code", "ARKHE_USER_WRITE_CODE_OK"),
+                ("user-exec-stack", "ARKHE_USER_EXEC_STACK_OK"),
+            ] {
+                smoke(case, marker)?;
+            }
+            Ok(())
+        }
         "smoke-exceptions" => {
             for (case, marker) in [
                 ("divide", "ARKHE_DIVIDE_OK"),
@@ -92,6 +103,23 @@ fn check() -> Result {
         "warnings",
     ]))?;
     run(Command::new("python3").args(["-m", "unittest", "discover", "-s", "tests"]))?;
+    run(Command::new("cargo")
+        .env(
+            "RUSTFLAGS",
+            "-C relocation-model=static -C code-model=small",
+        )
+        .args([
+            "clippy",
+            "--locked",
+            "--package",
+            "arkhe-init",
+            "--target",
+            TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+    build_userspace("boot")?;
     build(false, "boot")?;
     run(Command::new("python3").arg("tools/audit_repo.py"))
 }
@@ -126,6 +154,35 @@ fn build(smoke: bool, case: &str) -> Result<PathBuf> {
         .arg("tools/check_elf.py")
         .arg(&kernel))?;
     Ok(kernel)
+}
+
+fn build_userspace(case: &str) -> Result<PathBuf> {
+    let directory = format!("target/user-{case}");
+    run(Command::new("cargo")
+        .args([
+            "build",
+            "--locked",
+            "--release",
+            "--package",
+            "arkhe-init",
+            "--target",
+            TARGET,
+            "--target-dir",
+            &directory,
+        ])
+        .env("ARKHE_TEST_CASE", case)
+        .env("CARGO_PROFILE_RELEASE_LTO", "false")
+        .env(
+            "RUSTFLAGS",
+            "-C relocation-model=static -C code-model=small",
+        ))?;
+    let executable = Path::new(&directory)
+        .join(TARGET)
+        .join("release/arkhe-init");
+    run(Command::new("python3")
+        .arg("tools/check_elf.py")
+        .arg(&executable))?;
+    Ok(executable)
 }
 
 fn lock_value(key: &str) -> Result<String> {
@@ -220,6 +277,11 @@ fn iso(smoke: bool, case: &str) -> Result<PathBuf> {
     fs::create_dir_all(&boot)?;
     fs::create_dir_all(&efi)?;
     fs::copy(kernel, staging.join("boot/arkhe-kernel"))?;
+    let executable = build_userspace(case)?;
+    run(Command::new("python3")
+        .arg("tools/mkinitramfs.py")
+        .arg(staging.join("boot/initramfs.tar"))
+        .arg(executable))?;
     fs::copy("boot/limine.conf", boot.join("limine.conf"))?;
     for file in [
         "limine-bios.sys",

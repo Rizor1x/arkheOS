@@ -26,12 +26,16 @@ jobs:
         run: python3 tools/audit_repo.py --staged --history
       - name: Fetch pinned bootloader
         run: cargo xtask fetch-bootloader
-      - name: BIOS boot
-        run: cargo xtask smoke
-      - name: BIOS exception delivery and recovery
-        run: cargo xtask smoke-exceptions
-      - name: UEFI boot
+      - name: BIOS kernel and userspace checks
+        run: |
+          cargo xtask smoke
+          cargo xtask smoke-exceptions
+          cargo xtask smoke-userspace
+      - name: UEFI kernel and userspace checks
         env:
           ARKHE_OVMF: /usr/share/OVMF/OVMF_CODE_4M.fd
           ARKHE_OVMF_VARS: /usr/share/OVMF/OVMF_VARS_4M.fd
-        run: cargo xtask smoke && cargo xtask smoke-exceptions
+        run: |
+          cargo xtask smoke
+          cargo xtask smoke-exceptions
+          cargo xtask smoke-userspace

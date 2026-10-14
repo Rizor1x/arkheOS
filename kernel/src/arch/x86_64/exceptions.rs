@@ -104,6 +104,7 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" {
     static arkhe_exception_entries: [usize; 32];
     fn arkhe_unexpected_entry();
+    fn arkhe_exception_128();
 }
 
 const _: () = assert!(core::mem::size_of::<Gate>() == 16);
@@ -126,7 +127,7 @@ pub fn init() {
         0x00af_fb00_0000_ffff,
     ]);
     let mut interrupt_stacks = [0; 7];
-    for (index, stack) in tables.stacks[..4].iter().enumerate() {
+    for (index, stack) in tables.stacks.iter().enumerate() {
         interrupt_stacks[index] = stack.as_ptr() as u64 + STACK_BYTES as u64;
     }
     tables.task = TaskState {
@@ -155,6 +156,8 @@ pub fn init() {
         };
         tables.idt[vector] = Gate::new(*address, stack);
     }
+    tables.idt[128] = Gate::new(arkhe_exception_128 as *const () as usize, 5);
+    tables.idt[128].attributes = 0xee;
     let gdt = TablePointer {
         limit: (core::mem::size_of_val(&tables.gdt) - 1) as u16,
         base: tables.gdt.as_ptr() as u64,
@@ -189,7 +192,16 @@ pub struct ExceptionFrame {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn arkhe_exception_dispatch(frame: &ExceptionFrame) {
+extern "C" fn arkhe_exception_dispatch(frame: &mut ExceptionFrame) {
+    if frame.vector == 128 && frame.code_segment & 3 == 3 {
+        frame.registers[14] = crate::user::syscall([
+            frame.registers[14],
+            frame.registers[8],
+            frame.registers[9],
+            frame.registers[12],
+        ]) as u64;
+        return;
+    }
     if frame.vector == 3 {
         return;
     }
@@ -197,6 +209,9 @@ extern "C" fn arkhe_exception_dispatch(frame: &ExceptionFrame) {
     // SAFETY: The handler runs at ring 0; reading CR2 does not modify CPU state.
     unsafe {
         core::arch::asm!("mov {}, cr2", out(reg) fault_address, options(nomem, nostack));
+    }
+    if frame.code_segment & 3 == 3 {
+        crate::user::fault(frame.vector, frame.error, fault_address);
     }
     write_console(format_args!(
         "exception: vector={} error={:#x} rip={:#x} cr2={fault_address:#x}\n",
@@ -283,7 +298,7 @@ pub fn trigger_test_fault() {
                 core::arch::asm!("mov rax, [{address}]", address = in(reg) TEST_FAULT_ADDRESS, out("rax") _);
             }
         }
-        "boot" => return,
+        "boot" | "user-kernel-read" | "user-cli" | "user-write-code" | "user-exec-stack" => return,
         _ => panic!("unknown fault test"),
     }
     panic!("expected CPU exception was not raised");

@@ -7,6 +7,13 @@ name = "arkhe-abi"
 version = "0.1.0"
 
 [[package]]
+name = "arkhe-init"
+version = "0.1.0"
+dependencies = [
+ "arkhe-abi",
+]
+
+[[package]]
 name = "arkhe-kernel"
 version = "0.1.0"
 dependencies = [

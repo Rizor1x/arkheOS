@@ -1,4 +1,5 @@
 pub mod exceptions;
+pub mod paging;
 mod serial;
 
 pub use serial::{init_console, write_console};
