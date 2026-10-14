@@ -13,7 +13,7 @@ ROOT_FILES = {
     "LICENSE", ".gitignore", ".editorconfig",
 }
 SOURCE_DIRS = {"kernel", "crates", "xtask", "boot", "tools", "tests"}
-SUFFIXES = {".rs", ".toml", ".py", ".ld", ".conf", ".lock"}
+SUFFIXES = {".rs", ".S", ".toml", ".py", ".ld", ".conf", ".lock"}
 FORBIDDEN_DIRS = {
     "target", "build", "dist", "vendor", "iso_root", "bootloader", ".cache", ".local",
     ".ssh", ".aws", ".codex", ".agents", ".idea", ".vscode", ".venv", "__pycache__",

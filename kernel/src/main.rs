@@ -14,6 +14,7 @@ use arkhe_kernel_core::memory::FrameAllocator;
 pub extern "C" fn _start() -> ! {
     cpu::disable_interrupts();
     cpu::init_console();
+    cpu::exceptions::init();
     cpu::write_console(format_args!("arkheOS: bootstrap\n"));
     let memory = boot::BootMemory::read().unwrap_or_else(|error| match error {
         boot::BootError::InvalidRegion(reason) => panic!("invalid memory region: {reason:?}"),
@@ -27,6 +28,12 @@ pub extern "C" fn _start() -> ! {
         memory.direct_map_offset
     ));
     check_core().expect("kernel core self-check failed");
+    cpu::exceptions::check_breakpoint();
+    cpu::write_console(format_args!(
+        "exceptions: GDT/TSS/IDT loaded, breakpoint restored\n"
+    ));
+    #[cfg(feature = "smoke")]
+    cpu::exceptions::trigger_test_fault();
     cpu::write_console(format_args!("ARKHE_BOOT_OK\n"));
     #[cfg(feature = "smoke")]
     cpu::exit_test(0x10);

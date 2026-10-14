@@ -25,16 +25,28 @@ fn dispatch() -> Result {
     let task = args.first().map(String::as_str).unwrap_or("help");
     match task {
         "help" if args.len() <= 1 => {
-            println!("cargo xtask <check|build|fetch-bootloader|iso|run|smoke|audit|hooks|doctor>");
+            println!(
+                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|audit|hooks|doctor>"
+            );
             Ok(())
         }
         _ if args.len() != 1 => Err("expected exactly one task; use cargo xtask help".into()),
         "check" => check(),
-        "build" => build(false).map(|_| ()),
+        "build" => build(false, "boot").map(|_| ()),
         "fetch-bootloader" => fetch_bootloader(),
-        "iso" => iso(false).map(|_| ()),
+        "iso" => iso(false, "boot").map(|_| ()),
         "run" => run_qemu(),
-        "smoke" => smoke(),
+        "smoke" => smoke("boot", "ARKHE_BOOT_OK"),
+        "smoke-exceptions" => {
+            for (case, marker) in [
+                ("divide", "ARKHE_DIVIDE_OK"),
+                ("page-fault", "ARKHE_PAGE_FAULT_OK"),
+                ("double-fault", "ARKHE_DOUBLE_FAULT_OK"),
+            ] {
+                smoke(case, marker)?;
+            }
+            Ok(())
+        }
         "audit" => run(Command::new("python3").arg("tools/audit_repo.py")),
         "hooks" => {
             ensure_git_root()?;
@@ -80,15 +92,15 @@ fn check() -> Result {
         "warnings",
     ]))?;
     run(Command::new("python3").args(["-m", "unittest", "discover", "-s", "tests"]))?;
-    build(false)?;
+    build(false, "boot")?;
     run(Command::new("python3").arg("tools/audit_repo.py"))
 }
 
-fn build(smoke: bool) -> Result<PathBuf> {
+fn build(smoke: bool, case: &str) -> Result<PathBuf> {
     let directory = if smoke {
-        "target/smoke"
+        format!("target/smoke-{case}")
     } else {
-        "target/kernel"
+        "target/kernel".into()
     };
     let mut command = Command::new("cargo");
     command.args([
@@ -100,13 +112,14 @@ fn build(smoke: bool) -> Result<PathBuf> {
         "--target",
         TARGET,
         "--target-dir",
-        directory,
+        &directory,
     ]);
+    command.env("ARKHE_TEST_CASE", case);
     if smoke {
         command.args(["--features", "smoke"]);
     }
     run(&mut command)?;
-    let kernel = Path::new(directory)
+    let kernel = Path::new(&directory)
         .join(TARGET)
         .join("release/arkhe-kernel");
     run(Command::new("python3")
@@ -190,10 +203,14 @@ fn verify_bootloader() -> Result {
     Ok(())
 }
 
-fn iso(smoke: bool) -> Result<PathBuf> {
+fn iso(smoke: bool, case: &str) -> Result<PathBuf> {
     verify_bootloader()?;
-    let kernel = build(smoke)?;
-    let directory = Path::new(if smoke { "build/smoke" } else { "build/normal" });
+    let kernel = build(smoke, case)?;
+    let directory = PathBuf::from(if smoke {
+        format!("build/smoke-{case}")
+    } else {
+        "build/normal".into()
+    });
     let staging = directory.join("iso_root");
     if staging.exists() {
         fs::remove_dir_all(&staging)?;
@@ -299,15 +316,18 @@ fn qemu(image: &Path) -> Result<Command> {
 }
 
 fn run_qemu() -> Result {
-    let image = iso(false)?;
+    let image = iso(false, "boot")?;
     println!("Serial console; stop QEMU with Ctrl+C");
     run(qemu(&image)?.args(["-serial", "stdio"]))
 }
 
-fn smoke() -> Result {
-    let image = iso(true)?;
-    let log_path = Path::new("build/smoke/serial.log");
-    let log = fs::File::create(log_path)?;
+fn smoke(case: &str, marker: &str) -> Result {
+    let image = iso(true, case)?;
+    let log_path = image
+        .parent()
+        .ok_or("image has no directory")?
+        .join("serial.log");
+    let log = fs::File::create(&log_path)?;
     let mut child = qemu(&image)?
         .args([
             "-device",
@@ -327,18 +347,24 @@ fn smoke() -> Result {
         if Instant::now() >= deadline {
             child.kill()?;
             child.wait()?;
-            return Err("QEMU smoke test timed out; inspect build/smoke/serial.log".into());
+            return Err(
+                format!("QEMU {case} test timed out; inspect {}", log_path.display()).into(),
+            );
         }
         thread::sleep(Duration::from_millis(100));
     };
-    let text = fs::read_to_string(log_path)?;
+    let text = fs::read_to_string(&log_path)?;
     if status.code() != Some(33)
-        || !text.lines().any(|line| line.trim() == "ARKHE_BOOT_OK")
+        || !text.lines().any(|line| line.trim() == marker)
         || text.contains("PANIC:")
     {
-        return Err(format!("boot check failed ({status}); inspect build/smoke/serial.log").into());
+        return Err(format!(
+            "{case} check failed ({status}); inspect {}",
+            log_path.display()
+        )
+        .into());
     }
-    println!("QEMU boot passed: ARKHE_BOOT_OK");
+    println!("QEMU {case} passed: {marker}");
     Ok(())
 }
 

@@ -28,8 +28,10 @@ jobs:
         run: cargo xtask fetch-bootloader
       - name: BIOS boot
         run: cargo xtask smoke
+      - name: BIOS exception delivery and recovery
+        run: cargo xtask smoke-exceptions
       - name: UEFI boot
         env:
           ARKHE_OVMF: /usr/share/OVMF/OVMF_CODE_4M.fd
           ARKHE_OVMF_VARS: /usr/share/OVMF/OVMF_VARS_4M.fd
-        run: cargo xtask smoke
+        run: cargo xtask smoke && cargo xtask smoke-exceptions

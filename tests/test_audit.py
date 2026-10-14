@@ -11,7 +11,8 @@ spec.loader.exec_module(audit)
 class AuditTests(unittest.TestCase):
     def test_source_and_lockfiles_are_allowed(self):
         for path in ["Cargo.lock", "README.md", ".cargo/config.toml", "kernel/src/main.rs",
-                     "boot/limine.lock", ".githooks/pre-commit", ".github/workflows/ci.yml"]:
+                     "boot/limine.lock", ".githooks/pre-commit", ".github/workflows/ci.yml",
+                     "kernel/src/arch/x86_64/exceptions.S"]:
             self.assertEqual(audit.path_issues(path), [], path)
 
     def test_artifacts_and_private_paths_are_rejected(self):

@@ -1,3 +1,4 @@
+pub mod exceptions;
 mod serial;
 
 pub use serial::{init_console, write_console};

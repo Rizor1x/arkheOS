@@ -4,8 +4,9 @@ An experimental x86_64 operating system written in Rust. The project aims for a
 small kernel, isolated system services, native applications, and a desktop interface.
 
 The current implementation boots through Limine, validates usable memory ranges,
-provides a serial console, and runs self-checks for capability and message-queue
-models. Process isolation, application execution, persistent storage, and a desktop
+provides a serial console, installs GDT/TSS/IDT with dedicated exception stacks,
+and runs self-checks for capability and message-queue models.
+Process isolation, application execution, persistent storage, and a desktop
 are under development. The kernel is not ready for everyday use.
 
 ## Build and run
@@ -42,11 +43,15 @@ Output appears in the serial console. Stop QEMU with Ctrl+C.
 ```sh
 cargo xtask check
 cargo xtask smoke
+cargo xtask smoke-exceptions
 ```
 
 `check` runs formatting, Clippy, host tests, the kernel build, and ELF and
 repository checks. `smoke` boots the kernel and requires both its success marker
 and the expected emulator exit code within 30 seconds.
+`smoke-exceptions` raises real divide, page, and double faults. The double-fault
+test verifies execution on its dedicated emergency stack; every boot also checks
+that a returning breakpoint restores registers and flags.
 
 For UEFI, provide a matching firmware code and variables template:
 
