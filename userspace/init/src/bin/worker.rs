@@ -22,6 +22,13 @@ pub extern "C" fn _start(console: u64, argument: u64, root: u64, sender: u64, re
         path.as_ptr() as u64,
         path.len() as u64,
     ) != Error::InvalidHandle as i64
+        || call(Syscall::ChannelCreate as u64, console, 0, 16)
+            != if console == 0 {
+                Error::InvalidHandle as i64
+            } else {
+                Error::PermissionDenied as i64
+            }
+        || call(Syscall::ChannelCreate as u64, (1 << 32) | 2, 0, 16) != Error::InvalidHandle as i64
         || call(Syscall::ProcessSpawn as u64, (1 << 32) | 2, 0, 0) != Error::InvalidHandle as i64
         || call(Syscall::ProcessSpawn as u64, console, 0, 0)
             != if console == 0 {

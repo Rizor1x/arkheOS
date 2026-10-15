@@ -31,6 +31,7 @@ enum Resource {
     File(OpenFile<'static>),
     Sender(EndpointId),
     Receiver(EndpointId),
+    ChannelFactory,
 }
 const BOOT_PROCESSES: usize = 3;
 const PROCESSES: usize = 4;
@@ -272,6 +273,9 @@ pub fn syscall(frame: &mut ExceptionFrame) {
         }
         Ok(Syscall::ProcessSpawn) => {
             frame.result(status(process::spawn(state, slot, a, b, c)));
+        }
+        Ok(Syscall::ChannelCreate) => {
+            frame.result(status(ipc::create(state, slot, a, b, c)));
         }
         Ok(Syscall::ProcessWait) => {
             if b != 0 || c != 0 {

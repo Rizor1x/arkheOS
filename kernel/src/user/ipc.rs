@@ -1,7 +1,72 @@
 use super::{Resource, State, Wait, block, status, wake};
 use crate::arch::x86_64::exceptions::ExceptionFrame;
-use arkhe_abi::{Error, Handle, MAX_MESSAGE_BYTES, Message};
+use arkhe_abi::{CHANNEL_PAIR_BYTES, ChannelPair, Error, Handle, MAX_MESSAGE_BYTES, Message};
 use arkhe_kernel_core::capability::Rights;
+
+pub(super) fn create(
+    state: &mut State,
+    slot: usize,
+    factory: u64,
+    pointer: u64,
+    length: u64,
+) -> Result<u64, Error> {
+    if !matches!(
+        state.processes[slot]
+            .capabilities
+            .resolve(Handle::from_raw(factory), Rights::CREATE)?,
+        Resource::ChannelFactory
+    ) {
+        return Err(Error::PermissionDenied);
+    }
+    if length != CHANNEL_PAIR_BYTES as u64 {
+        return Err(Error::InvalidArgument);
+    }
+    state.processes[slot]
+        .space
+        .validate_write(pointer, CHANNEL_PAIR_BYTES)
+        .map_err(|_| Error::InvalidArgument)?;
+    let endpoint = state.endpoints.create()?;
+    let handles = state.processes[slot].capabilities.insert_pair(
+        (Resource::Sender(endpoint), Rights::SEND),
+        (Resource::Receiver(endpoint), Rights::RECEIVE),
+    );
+    let [sender, receiver] = match handles {
+        Ok(handles) => handles,
+        Err(error) => {
+            discard(state, endpoint);
+            return Err(error);
+        }
+    };
+    let bytes = ChannelPair { sender, receiver }.encode();
+    // Mappings cannot change during this IRQ-masked BSP entry. Copy still preflights
+    // the whole result; an error must unpublish both handles and the endpoint.
+    if state.processes[slot]
+        .space
+        .copy_to_user(pointer, &bytes)
+        .is_err()
+    {
+        for handle in [sender, receiver] {
+            state.processes[slot]
+                .capabilities
+                .remove(handle)
+                .expect("unpublished channel side");
+        }
+        discard(state, endpoint);
+        return Err(Error::InvalidArgument);
+    }
+    Ok(0)
+}
+
+fn discard(state: &mut State, endpoint: arkhe_kernel_core::endpoint::EndpointId) {
+    state
+        .endpoints
+        .close_sender(endpoint)
+        .expect("unpublished sender");
+    state
+        .endpoints
+        .close_receiver(endpoint)
+        .expect("unpublished receiver");
+}
 
 pub(super) fn send(
     state: &mut State,

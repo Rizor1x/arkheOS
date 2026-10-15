@@ -7,6 +7,7 @@ pub const ABI_VERSION: u32 = 1;
 pub const MAX_IO_BYTES: usize = 256;
 pub const MAX_PATH_BYTES: usize = 100;
 pub const MAX_MESSAGE_BYTES: usize = 64;
+pub const CHANNEL_PAIR_BYTES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
@@ -24,6 +25,7 @@ pub enum Syscall {
     SleepTicks = 10,
     ProcessSpawn = 11,
     ProcessWait = 12,
+    ChannelCreate = 13,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -44,6 +46,7 @@ impl TryFrom<u64> for Syscall {
             10 => Ok(Self::SleepTicks),
             11 => Ok(Self::ProcessSpawn),
             12 => Ok(Self::ProcessWait),
+            13 => Ok(Self::ChannelCreate),
             _ => Err(Error::Unsupported),
         }
     }
@@ -76,6 +79,32 @@ impl Handle {
 
     pub const fn raw(self) -> u64 {
         self.0
+    }
+}
+
+/// ChannelCreate writes two process-local handles as little-endian u64 values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelPair {
+    pub sender: Handle,
+    pub receiver: Handle,
+}
+
+impl ChannelPair {
+    pub fn encode(self) -> [u8; CHANNEL_PAIR_BYTES] {
+        let mut bytes = [0; CHANNEL_PAIR_BYTES];
+        bytes[..8].copy_from_slice(&self.sender.raw().to_le_bytes());
+        bytes[8..].copy_from_slice(&self.receiver.raw().to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let bytes: &[u8; CHANNEL_PAIR_BYTES] =
+            bytes.try_into().map_err(|_| Error::InvalidArgument)?;
+        let words = bytes.as_chunks::<8>().0;
+        Ok(Self {
+            sender: Handle::from_raw(u64::from_le_bytes(words[0])),
+            receiver: Handle::from_raw(u64::from_le_bytes(words[1])),
+        })
     }
 }
 
@@ -119,5 +148,29 @@ mod tests {
         assert_eq!(Message::new(&[0; 65]), Err(Error::InvalidArgument));
         assert_eq!(Message::new(&[7; 64]).unwrap().payload(), &[7; 64]);
         assert!(Message::new(&[]).unwrap().payload().is_empty());
+    }
+
+    #[test]
+    fn channel_pair_has_fixed_byte_order_and_exact_length() {
+        let pair = ChannelPair {
+            sender: Handle::from_raw(0x0102_0304_0506_0708),
+            receiver: Handle::from_raw(0x1112_1314_1516_1718),
+        };
+        let bytes = [8, 7, 6, 5, 4, 3, 2, 1, 24, 23, 22, 21, 20, 19, 18, 17];
+        assert_eq!(pair.encode(), bytes);
+        assert_eq!(ChannelPair::decode(&bytes), Ok(pair));
+        for length in 0..CHANNEL_PAIR_BYTES {
+            assert_eq!(
+                ChannelPair::decode(&bytes[..length]),
+                Err(Error::InvalidArgument)
+            );
+        }
+        assert_eq!(
+            ChannelPair::decode(&[0; CHANNEL_PAIR_BYTES + 1]),
+            Err(Error::InvalidArgument)
+        );
+        let mut unaligned = [0; CHANNEL_PAIR_BYTES + 1];
+        unaligned[1..].copy_from_slice(&bytes);
+        assert_eq!(ChannelPair::decode(&unaligned[1..]), Ok(pair));
     }
 }

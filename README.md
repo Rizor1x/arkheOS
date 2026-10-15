@@ -15,6 +15,7 @@ Implemented:
 - validated usable RAM ranges, owned frame leases, and per-process page tables;
 - single-CPU round-robin preemption, voluntary yield, timer sleep, and interrupt-driven idle;
 - capability-checked message delivery, blocked receivers, and peer-close wakeups;
+- channel creation through explicit authority, with transactional descriptor allocation;
 - legacy PC PIC/PIT timer at approximately 100 Hz;
 - RX user code, RW/NX data and stack, and unmapped stack guard pages;
 - bounded USTAR initramfs with checked headers and indexed file lookup;
@@ -26,11 +27,12 @@ Implemented:
 - host tests and real kernel/user fault injection under BIOS and UEFI QEMU.
 
 Execution uses one CPU with at most four live processes. Kernel higher-half
-mappings are inherited from Limine; APIC, SMP, and dynamic channel creation are
+mappings are inherited from Limine; APIC and SMP are not implemented. Channels
+can be created within a process; granting their sides to spawned children is
 not implemented. Children receive only an explicitly granted console, without
-namespace or process-creation authority. Persistent storage, Rust `std`, Python,
-and a desktop are not supported yet. The kernel is experimental and is not
-ready for everyday use.
+namespace, channel-creation, or process-creation authority. Persistent storage,
+Rust `std`, Python, and a desktop are not supported yet. The kernel is
+experimental and is not ready for everyday use.
 
 ## Build and run
 
@@ -110,6 +112,9 @@ records across slot reuse, and process/descriptor exhaustion. Closing a watcher
 or exiting its parent must let the child finish and release every resource.
 A child without a console must receive no capabilities. These checks also run
 in the normal startup demonstration, except for the malformed-image fixture.
+The supervisor also tests channel creation, side rights, queue backpressure,
+stale handles, full descriptor/endpoint quotas, rejected and cross-page result
+buffers, and cleanup of channels left open at process exit.
 
 For UEFI, provide a matching firmware code and variables template:
 
@@ -162,12 +167,12 @@ block-device support and recovery tests come before that decision.
 
 Applications are static x86_64 ELF64 executables with a Rust `no_std` runtime.
 The entry function receives its console handle in RDI, an application argument
-in RSI, a namespace handle in RDX, an outgoing channel handle in RCX, and an
-incoming channel handle in R8. Unavailable grants are zero. The boot supervisor
-receives console and namespace; spawned children receive only the optional
-console. Boundary tests use three boot instances with role numbers and ring
-channels. `userspace/init` provides complete build and syscall examples. The
-ABI is experimental.
+in RSI, and a namespace handle in RDX. The boot supervisor receives its channel
+factory handle in RCX and zero in R8. Boundary tests instead receive an outgoing
+channel in RCX and an incoming channel in R8, with role numbers in RSI.
+Spawned children receive only the optional console and argument; RDX, RCX, and
+R8 are zero. `userspace/init` provides complete build and syscall examples.
+The ABI is experimental.
 
 `int 0x80` takes a call number in RAX and arguments in RDI, RSI, and RDX.
 RAX returns a nonnegative result or a negative `arkhe-abi::Error`; other GPRs are
@@ -189,11 +194,12 @@ thread-local storage are not supported. Software floating point uses the bare Ru
 | SleepTicks | 10 | Relative delivered timer ticks, 0..1000; returns 0 after waking |
 | ProcessSpawn | 11 | Executable file handle, argument, console handle or 0; returns a child watcher handle |
 | ProcessWait | 12 | Child watcher handle, 0, 0; blocks until completion, returns status and consumes the handle |
+| ChannelCreate | 13 | Channel factory handle, writable result pointer, length exactly 16; returns 0 |
 
 File paths are relative to the granted boot namespace. Empty/absolute paths,
 `.`/`..` components, repeated separators, backslashes, and control characters
 are rejected. Open returns `NotFound` for absent files and `NoSpace` when the
-process's eight capability slots are full. The supervisor starts with two grants;
+process's eight capability slots are full. The supervisor starts with three grants;
 boundary-test instances start with four. Closing a handle frees its slot.
 Handles are local to a process; closed generations never become valid again.
 
@@ -221,7 +227,16 @@ exit closes its watchers; children continue independently. There are eight bound
 completion records, including running children and uncollected outcomes. There
 is no process kill, arbitrary capability transfer, or `fork`/`exec` interface.
 
-Each boot channel has one sender, one receiver, and a four-message FIFO. Send is
+ChannelCreate requires a dedicated factory capability with create authority.
+It writes two little-endian u64 handles, sender first and receiver second.
+The whole result must be writable user memory, including unaligned buffers and
+page crossings. Invalid buffers are rejected before allocation; quota failures
+publish neither side and leave the destination unchanged. Creation requires two
+free capability slots and one of the three global endpoint slots. Closing the
+factory prevents further creation through that handle; existing channels remain
+usable. `arkhe-abi::ChannelPair` encodes and decodes this byte format.
+
+Each channel has one sender, one receiver, and a four-message FIFO. Send is
 nonblocking: a full queue returns `WouldBlock`; no receivers returns `PeerClosed`.
 Receive returns the message length. Empty queues block without polling; the whole
 advertised buffer is checked before waiting. A small buffer returns `BufferTooSmall`
@@ -233,8 +248,8 @@ Closing the sender allows queued data to drain, then wakes receivers with
 `PeerClosed`. Closing the receiver discards its queue and prevents further sends.
 Exit and user faults close every owned endpoint. Slots carry nonwrapping
 generations and cannot be reused through stale endpoint IDs. Boot grants form a
-three-process ring; channel creation, duplication, capability transfer, shared
-memory, and RPC reply capabilities are not implemented.
+three-process ring; duplication, capability transfer, spawn grants for channel
+sides, shared memory, and RPC reply capabilities are not implemented.
 
 Each application has a 16 KiB stack. Exit and user faults release that process’s mappings after CR3
 has switched away; the remaining runnable processes continue. The frame pool

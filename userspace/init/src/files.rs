@@ -47,6 +47,10 @@ fn opened(result: i64) -> u64 {
 }
 
 pub fn check(console: u64, root: u64) {
+    expect(
+        call(Syscall::ChannelCreate as u64, root, 0, 16),
+        Error::PermissionDenied as i64,
+    );
     let destination = BUFFER.0[4093].as_ptr() as u64;
     let file = opened(open(root, b"etc/motd"));
     for (handle, expected) in [

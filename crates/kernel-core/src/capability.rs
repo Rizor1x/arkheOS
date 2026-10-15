@@ -13,6 +13,7 @@ impl Rights {
     pub const EXECUTE: Self = Self(16);
     pub const SPAWN: Self = Self(32);
     pub const WAIT: Self = Self(64);
+    pub const CREATE: Self = Self(128);
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -59,16 +60,42 @@ impl<const N: usize, T: Copy> CapabilityTable<N, T> {
     }
 
     pub fn insert(&mut self, object: T, rights: Rights) -> Result<Handle, Error> {
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            if slot.entry.is_none() && slot.generation != 0 && slot.generation <= MAX_GENERATION {
-                let index = u32::try_from(index).map_err(|_| Error::NoSpace)?;
-                slot.entry = Some(Entry { object, rights });
-                return Ok(Handle::from_raw(
-                    (u64::from(slot.generation) << 32) | u64::from(index),
-                ));
-            }
-        }
-        Err(Error::NoSpace)
+        let index = self.vacant_slots().next().ok_or(Error::NoSpace)?;
+        let index = u32::try_from(index).map_err(|_| Error::NoSpace)?;
+        Ok(self.occupy(index, object, rights))
+    }
+
+    /// Insert both entries or leave entries and generations unchanged.
+    pub fn insert_pair(
+        &mut self,
+        first: (T, Rights),
+        second: (T, Rights),
+    ) -> Result<[Handle; 2], Error> {
+        let (first_index, second_index) = {
+            let mut slots = self.vacant_slots();
+            let first =
+                u32::try_from(slots.next().ok_or(Error::NoSpace)?).map_err(|_| Error::NoSpace)?;
+            let second =
+                u32::try_from(slots.next().ok_or(Error::NoSpace)?).map_err(|_| Error::NoSpace)?;
+            (first, second)
+        };
+        Ok([
+            self.occupy(first_index, first.0, first.1),
+            self.occupy(second_index, second.0, second.1),
+        ])
+    }
+
+    fn vacant_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            (slot.entry.is_none() && slot.generation != 0 && slot.generation <= MAX_GENERATION)
+                .then_some(index)
+        })
+    }
+
+    fn occupy(&mut self, index: u32, object: T, rights: Rights) -> Handle {
+        let slot = &mut self.slots[index as usize];
+        slot.entry = Some(Entry { object, rights });
+        Handle::from_raw((u64::from(slot.generation) << 32) | u64::from(index))
     }
 
     pub fn resolve(&self, handle: Handle, required: Rights) -> Result<T, Error> {
@@ -130,6 +157,77 @@ impl<const N: usize, T: Copy> CapabilityTable<N, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pair_failure_preserves_entries_and_unpublished_generations() {
+        let mut table = CapabilityTable::<2>::new();
+        let existing = table.insert(ObjectId(1), Rights::CREATE).unwrap();
+        for _ in 0..16 {
+            assert_eq!(
+                table.insert_pair((ObjectId(2), Rights::SEND), (ObjectId(3), Rights::RECEIVE)),
+                Err(Error::NoSpace)
+            );
+        }
+        assert_eq!(table.resolve(existing, Rights::CREATE), Ok(ObjectId(1)));
+        assert_eq!(table.slots[1].generation, 1);
+        assert!(table.slots[1].entry.is_none());
+        table.close(existing).unwrap();
+        let [sender, receiver] = table
+            .insert_pair((ObjectId(2), Rights::SEND), (ObjectId(3), Rights::RECEIVE))
+            .unwrap();
+        assert_eq!(sender.raw(), 2 << 32);
+        assert_eq!(receiver.raw(), (1 << 32) | 1);
+        assert_eq!(table.resolve(sender, Rights::SEND), Ok(ObjectId(2)));
+        assert_eq!(table.resolve(receiver, Rights::RECEIVE), Ok(ObjectId(3)));
+        assert_eq!(
+            table.resolve(sender, Rights::RECEIVE),
+            Err(Error::PermissionDenied)
+        );
+        assert_eq!(
+            table.resolve(receiver, Rights::CREATE),
+            Err(Error::PermissionDenied)
+        );
+        assert_eq!(
+            table.resolve(existing, Rights::CREATE),
+            Err(Error::InvalidHandle)
+        );
+    }
+
+    #[test]
+    fn pair_allocation_skips_retired_slots_and_never_wraps() {
+        let mut table = CapabilityTable::<3>::new();
+        table.slots[0].generation = 0;
+        table.slots[1].generation = MAX_GENERATION;
+        table.slots[2].generation = MAX_GENERATION;
+        let [a, b] = table
+            .insert_pair((ObjectId(1), Rights::SEND), (ObjectId(2), Rights::RECEIVE))
+            .unwrap();
+        assert_eq!(a.raw() as u32, 1);
+        assert_eq!(b.raw() as u32, 2);
+        assert!(a.raw() <= i64::MAX as u64 && b.raw() <= i64::MAX as u64);
+        table.close(a).unwrap();
+        table.close(b).unwrap();
+        assert_eq!(
+            table.insert_pair((ObjectId(1), Rights::SEND), (ObjectId(2), Rights::RECEIVE)),
+            Err(Error::NoSpace)
+        );
+        {
+            let mut table = CapabilityTable::<1>::new();
+            assert_eq!(
+                table.insert_pair((ObjectId(1), Rights::SEND), (ObjectId(2), Rights::RECEIVE)),
+                Err(Error::NoSpace)
+            );
+            assert_eq!(
+                table.insert(ObjectId(3), Rights::CREATE).unwrap().raw(),
+                1 << 32
+            );
+        }
+        assert_eq!(
+            CapabilityTable::<0>::new()
+                .insert_pair((ObjectId(1), Rights::SEND), (ObjectId(2), Rights::RECEIVE)),
+            Err(Error::NoSpace)
+        );
+    }
 
     #[test]
     fn rights_are_checked_and_stale_handles_rejected() {

@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+#[path = "../channels.rs"]
+mod channels;
 #[path = "../runtime.rs"]
 mod runtime;
 use arkhe_abi::{Error, FAULT_STATUS_BASE, Syscall};
@@ -36,7 +38,8 @@ fn wait(handle: u64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(console: u64, _: u64, root: u64) -> ! {
+pub extern "C" fn _start(console: u64, _: u64, root: u64, factory: u64) -> ! {
+    channels::check(console, root, factory);
     let image = open(root, "bin/worker");
     require(console, image > 0, "supervisor: worker missing\n");
     let image = image as u64;
@@ -63,6 +66,14 @@ pub extern "C" fn _start(console: u64, _: u64, root: u64) -> ! {
         ) == text.len() as i64,
         "supervisor: console failed\n",
     );
+    for handle in [console, root, image] {
+        require(
+            console,
+            call(Syscall::Close as u64, handle, 0, 0) == 0,
+            "supervisor: final handle close failed\n",
+        );
+    }
+    channels::check_exit_cleanup(factory);
     exit(0)
 }
 
@@ -173,7 +184,7 @@ fn check_process_quota(console: u64, image: u64) {
 }
 
 fn check_descriptor_quota(console: u64, root: u64, image: u64) {
-    let mut files = [0u64; 5];
+    let mut files = [0u64; 4];
     for handle in &mut files {
         let file = open(root, "etc/motd");
         require(console, file > 0, "supervisor: descriptor setup failed\n");

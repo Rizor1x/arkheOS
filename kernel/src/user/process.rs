@@ -21,13 +21,17 @@ pub(super) fn launch_supervisor(state: &mut State) {
         .capabilities
         .insert(Resource::Directory, Rights::OPEN.union(Rights::SPAWN))
         .expect("supervisor namespace");
+    let factory = process
+        .capabilities
+        .insert(Resource::ChannelFactory, Rights::CREATE)
+        .expect("channel factory capability");
     process.context = ExceptionFrame::user(
         image.entry(),
         STACK_TOP - 8,
         console.raw(),
         0,
         root.raw(),
-        0,
+        factory.raw(),
         0,
     );
     process.ticks = 0;
