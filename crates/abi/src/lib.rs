@@ -8,6 +8,7 @@ pub const MAX_IO_BYTES: usize = 256;
 pub const MAX_PATH_BYTES: usize = 100;
 pub const MAX_MESSAGE_BYTES: usize = 64;
 pub const CHANNEL_PAIR_BYTES: usize = 16;
+pub const SPAWN_GRANTS_BYTES: usize = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
@@ -26,6 +27,7 @@ pub enum Syscall {
     ProcessSpawn = 11,
     ProcessWait = 12,
     ChannelCreate = 13,
+    ProcessSpawnWithGrants = 14,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -47,6 +49,7 @@ impl TryFrom<u64> for Syscall {
             11 => Ok(Self::ProcessSpawn),
             12 => Ok(Self::ProcessWait),
             13 => Ok(Self::ChannelCreate),
+            14 => Ok(Self::ProcessSpawnWithGrants),
             _ => Err(Error::Unsupported),
         }
     }
@@ -104,6 +107,42 @@ impl ChannelPair {
         Ok(Self {
             sender: Handle::from_raw(u64::from_le_bytes(words[0])),
             receiver: Handle::from_raw(u64::from_le_bytes(words[1])),
+        })
+    }
+}
+
+/// ProcessSpawnWithGrants retains the parent's console handle and moves nonzero
+/// channel sides only on success. The descriptor has three little-endian u64 handles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpawnGrants {
+    pub console: Handle,
+    pub sender: Handle,
+    pub receiver: Handle,
+}
+
+impl SpawnGrants {
+    pub const NONE: Self = Self {
+        console: Handle::from_raw(0),
+        sender: Handle::from_raw(0),
+        receiver: Handle::from_raw(0),
+    };
+
+    pub fn encode(self) -> [u8; SPAWN_GRANTS_BYTES] {
+        let mut bytes = [0; SPAWN_GRANTS_BYTES];
+        bytes[..8].copy_from_slice(&self.console.raw().to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.sender.raw().to_le_bytes());
+        bytes[16..].copy_from_slice(&self.receiver.raw().to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let bytes: &[u8; SPAWN_GRANTS_BYTES] =
+            bytes.try_into().map_err(|_| Error::InvalidArgument)?;
+        let words = bytes.as_chunks::<8>().0;
+        Ok(Self {
+            console: Handle::from_raw(u64::from_le_bytes(words[0])),
+            sender: Handle::from_raw(u64::from_le_bytes(words[1])),
+            receiver: Handle::from_raw(u64::from_le_bytes(words[2])),
         })
     }
 }
@@ -172,5 +211,38 @@ mod tests {
         let mut unaligned = [0; CHANNEL_PAIR_BYTES + 1];
         unaligned[1..].copy_from_slice(&bytes);
         assert_eq!(ChannelPair::decode(&unaligned[1..]), Ok(pair));
+    }
+
+    #[test]
+    fn spawn_grants_have_exact_order_length_and_allow_absent_handles() {
+        let grants = SpawnGrants {
+            console: Handle::from_raw(0x0102_0304_0506_0708),
+            sender: Handle::from_raw(0x1112_1314_1516_1718),
+            receiver: Handle::from_raw(0x2122_2324_2526_2728),
+        };
+        let bytes = [
+            8, 7, 6, 5, 4, 3, 2, 1, 24, 23, 22, 21, 20, 19, 18, 17, 40, 39, 38, 37, 36, 35, 34, 33,
+        ];
+        assert_eq!(grants.encode(), bytes);
+        assert_eq!(SpawnGrants::decode(&bytes), Ok(grants));
+        assert_eq!(SpawnGrants::NONE.encode(), [0; SPAWN_GRANTS_BYTES]);
+        assert_eq!(
+            SpawnGrants::decode(&[0; SPAWN_GRANTS_BYTES]),
+            Ok(SpawnGrants::NONE)
+        );
+        for length in 0..SPAWN_GRANTS_BYTES {
+            assert_eq!(
+                SpawnGrants::decode(&bytes[..length]),
+                Err(Error::InvalidArgument)
+            );
+        }
+        assert_eq!(
+            SpawnGrants::decode(&[0; SPAWN_GRANTS_BYTES + 1]),
+            Err(Error::InvalidArgument)
+        );
+        let mut unaligned = [0; SPAWN_GRANTS_BYTES + 1];
+        unaligned[1..].copy_from_slice(&bytes);
+        assert_eq!(SpawnGrants::decode(&unaligned[1..]), Ok(grants));
+        assert_eq!(Syscall::try_from(14), Ok(Syscall::ProcessSpawnWithGrants));
     }
 }

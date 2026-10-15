@@ -163,6 +163,15 @@ pub fn check(console: u64, root: u64) {
         call(Syscall::ProcessSpawn as u64, executable, 0, console),
         Error::PermissionDenied as i64,
     );
+    expect(
+        call(
+            Syscall::ProcessSpawnWithGrants as u64,
+            executable,
+            0,
+            u64::MAX,
+        ),
+        Error::PermissionDenied as i64,
+    );
     expect(read(executable, destination, 4), 4);
     for (index, byte) in b"\x7fELF".iter().enumerate() {
         if BUFFER.0[4093 + index].load(Ordering::Relaxed) != *byte {

@@ -6,8 +6,9 @@ small kernel, isolated system services, native applications, and a desktop inter
 The kernel boots through BIOS or UEFI and starts a native Rust supervisor in
 ring 3. The supervisor loads programs from a read-only initramfs, waits for their
 exit, and restarts a child after a deliberate fault. Every program has its own
-address space and capability table. The demonstration repeats after reclaiming
-all process frames and completion records.
+address space and capability table. The supervisor also creates channels and
+grants their sides to children for binary request/reply exchanges. The
+demonstration repeats after reclaiming all process frames and completion records.
 
 Implemented:
 
@@ -23,14 +24,14 @@ Implemented:
 - version, console-write, close, yield, timer-tick, file-open/read, and exit calls
   through `int 0x80`;
 - capability-controlled process creation, blocking wait, and retained exit/fault status;
+- explicit channel-side moves at child startup, with source handles preserved on failure;
 - page reclamation on exit/fault and rollback of partially loaded executables;
 - host tests and real kernel/user fault injection under BIOS and UEFI QEMU.
 
 Execution uses one CPU with at most four live processes. Kernel higher-half
-mappings are inherited from Limine; APIC and SMP are not implemented. Channels
-can be created within a process; granting their sides to spawned children is
-not implemented. Children receive only an explicitly granted console, without
-namespace, channel-creation, or process-creation authority. Persistent storage,
+mappings are inherited from Limine; APIC and SMP are not implemented. Children
+receive only an explicitly granted console and channel sides, without namespace,
+channel-creation, or process-creation authority. Persistent storage,
 Rust `std`, Python, and a desktop are not supported yet. The kernel is
 experimental and is not ready for everyday use.
 
@@ -115,6 +116,11 @@ in the normal startup demonstration, except for the malformed-image fixture.
 The supervisor also tests channel creation, side rights, queue backpressure,
 stale handles, full descriptor/endpoint quotas, rejected and cross-page result
 buffers, and cleanup of channels left open at process exit.
+Spawn grants are checked against wrong resource types, stale handles, unreadable
+and cross-page descriptors, malformed images, and full process/descriptor quotas.
+Children exchange binary requests and replies, restart after a fault, and wake
+blocked peers on close or death. An orphan drains queued input after parent exit
+and confirms peer closure in each round; boot/process smoke requires both confirmations.
 
 For UEFI, provide a matching firmware code and variables template:
 
@@ -170,8 +176,10 @@ The entry function receives its console handle in RDI, an application argument
 in RSI, and a namespace handle in RDX. The boot supervisor receives its channel
 factory handle in RCX and zero in R8. Boundary tests instead receive an outgoing
 channel in RCX and an incoming channel in R8, with role numbers in RSI.
-Spawned children receive only the optional console and argument; RDX, RCX, and
-R8 are zero. `userspace/init` provides complete build and syscall examples.
+Spawned children receive the optional console and argument, a moved sender in
+RCX, and a moved receiver in R8; RDX is zero. Absent grants are zero. The original
+ProcessSpawn call supplies no channel sides. `userspace/init` provides complete
+build and syscall examples.
 The ABI is experimental.
 
 `int 0x80` takes a call number in RAX and arguments in RDI, RSI, and RDX.
@@ -195,6 +203,7 @@ thread-local storage are not supported. Software floating point uses the bare Ru
 | ProcessSpawn | 11 | Executable file handle, argument, console handle or 0; returns a child watcher handle |
 | ProcessWait | 12 | Child watcher handle, 0, 0; blocks until completion, returns status and consumes the handle |
 | ChannelCreate | 13 | Channel factory handle, writable result pointer, length exactly 16; returns 0 |
+| ProcessSpawnWithGrants | 14 | Executable file handle, argument, pointer to a 24-byte grant descriptor; returns a child watcher handle |
 
 File paths are relative to the granted boot namespace. Empty/absolute paths,
 `.`/`..` components, repeated separators, backslashes, and control characters
@@ -215,9 +224,25 @@ only for files with an execute mode bit opened through a namespace with spawn
 authority. Read access alone is insufficient. These are native capability rules,
 not POSIX user/group or setuid permissions. File cursor position does not affect
 execution. A child gets zeroed private pages and the explicitly selected console;
-no file, namespace, IPC, or spawn capability is inherited. Invalid images return
+channel sides can be explicitly moved with ProcessSpawnWithGrants. No file,
+namespace, channel factory, or spawn capability is inherited. Invalid images return
 `BadExecutable`; exhausted process/descriptor/record quotas return `NoSpace`,
 and frame exhaustion returns `NoMemory`. Failed creation rolls back reservations.
+
+ProcessSpawnWithGrants reads three little-endian u64 handles: console, sender,
+receiver. Zero omits a grant. The descriptor can be read-only, unaligned, or cross
+mapped pages; all 24 bytes are copied into kernel memory before any reservation.
+Console authority remains with the parent; each channel side moves to the child
+only on success. Its old parent handle becomes invalid, and the child receives
+a handle in its own table. Only the matching resource type and SEND/RECEIVE right
+are accepted; the same nonzero handle in both side fields is rejected.
+
+All descriptor, authority, executable, quota, and load failures preserve the
+parent's channel sides and queued data. The parent needs a free watcher slot
+before the moves, even when those moves would free slots. Moving a side does not
+close the endpoint or wake its peer. Child close, exit, or fault releases the
+moved side normally. Both sides of one channel may move to the same child;
+request/reply between processes uses two channels.
 
 Wait returns a normal exit code in 0..2³²−1, or `FAULT_STATUS_BASE | vector` for
 an x86 user exception. Waiting consumes the watcher exactly once; waiting again
@@ -248,8 +273,9 @@ Closing the sender allows queued data to drain, then wakes receivers with
 `PeerClosed`. Closing the receiver discards its queue and prevents further sends.
 Exit and user faults close every owned endpoint. Slots carry nonwrapping
 generations and cannot be reused through stale endpoint IDs. Boot grants form a
-three-process ring; duplication, capability transfer, spawn grants for channel
-sides, shared memory, and RPC reply capabilities are not implemented.
+three-process ring. Child startup supports the bounded moves described above;
+duplication, arbitrary capability transfer through messages, shared memory, and
+RPC reply capabilities are not implemented.
 
 Each application has a 16 KiB stack. Exit and user faults release that process’s mappings after CR3
 has switched away; the remaining runnable processes continue. The frame pool

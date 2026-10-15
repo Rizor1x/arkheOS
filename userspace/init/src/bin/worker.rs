@@ -3,6 +3,8 @@
 
 #[path = "../runtime.rs"]
 mod runtime;
+#[path = "../service.rs"]
+mod service;
 use arkhe_abi::{Error, Syscall};
 use core::sync::atomic::{AtomicU64, Ordering};
 use runtime::{call, exit};
@@ -11,10 +13,16 @@ static BSS: AtomicU64 = AtomicU64::new(0);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(console: u64, argument: u64, root: u64, sender: u64, receiver: u64) -> ! {
-    if root != 0 || sender != 0 || receiver != 0 || BSS.load(Ordering::Relaxed) != 0 {
+    if BSS.load(Ordering::Relaxed) != 0 {
         exit(1);
     }
     BSS.store(argument + 1, Ordering::Relaxed);
+    if (0x600..0x700).contains(&argument) {
+        service::run(console, argument, root, sender, receiver);
+    }
+    if root != 0 || sender != 0 || receiver != 0 {
+        exit(1);
+    }
     let path = b"bin/worker";
     if call(
         Syscall::FileOpen as u64,

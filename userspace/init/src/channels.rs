@@ -12,7 +12,7 @@ fn create(factory: u64, pointer: u64, length: u64) -> i64 {
     call(Syscall::ChannelCreate as u64, factory, pointer, length)
 }
 
-fn pair(console: u64, factory: u64) -> ChannelPair {
+pub(super) fn pair(console: u64, factory: u64) -> ChannelPair {
     let mut bytes = [0; CHANNEL_PAIR_BYTES];
     require(
         console,
@@ -25,7 +25,7 @@ fn pair(console: u64, factory: u64) -> ChannelPair {
     }
 }
 
-fn close(console: u64, handle: u64) {
+pub(super) fn close(console: u64, handle: u64) {
     require(
         console,
         call(Syscall::Close as u64, handle, 0, 0) == 0,
@@ -219,32 +219,39 @@ fn check_cap_quota(console: u64, root: u64, factory: u64) {
     close(console, channel.receiver.raw());
 }
 
-pub fn check_exit_cleanup(factory: u64) {
-    // Only the factory and an orphan watcher remain, leaving six capability slots.
-    let channels = [pair(0, factory), pair(0, factory), pair(0, factory)];
-    close(0, channels[0].sender.raw());
-    close(0, channels[1].receiver.raw());
+pub fn check_exit_cleanup(console: u64, factory: u64, image: u64) {
+    let orphan_channel = pair(console, factory);
+    let orphan = crate::grants::start(
+        image,
+        0x604,
+        crate::grants::options(console, 0, orphan_channel.receiver.raw()),
+    );
+    require(console, orphan > 0, "channel: orphan grant failed\n");
+    close(console, image);
+    // Console, factory, watcher and the orphan's sender leave four slots for two pairs.
+    let channels = [pair(console, factory), pair(console, factory)];
+    close(console, channels[0].sender.raw());
+    close(console, channels[1].receiver.raw());
     let mut bytes = [0xa5u8; CHANNEL_PAIR_BYTES];
     for _ in 0..12 {
         require(
-            0,
+            console,
             create(factory, bytes.as_mut_ptr() as u64, bytes.len() as u64) == Error::NoSpace as i64
                 && bytes == [0xa5; CHANNEL_PAIR_BYTES],
             "channel: endpoint quota failed\n",
         );
     }
-    close(0, factory);
+    close(console, factory);
     require(
-        0,
+        console,
         create(factory, bytes.as_mut_ptr() as u64, bytes.len() as u64)
             == Error::InvalidHandle as i64
             && call(Syscall::Receive as u64, channels[0].receiver.raw(), 0, 0)
                 == Error::PeerClosed as i64
             && call(Syscall::Send as u64, channels[1].sender.raw(), 0, 0)
                 == Error::PeerClosed as i64
-            && call(Syscall::Send as u64, channels[2].sender.raw(), 0, 0) == 0
-            && call(Syscall::Receive as u64, channels[2].receiver.raw(), 0, 0) == 0
-            && call(Syscall::Send as u64, channels[2].sender.raw(), 0, 0) == 0,
+            && call(Syscall::Send as u64, orphan_channel.sender.raw(), 0, 0) == 0,
         "channel: factory close revoked existing channel\n",
     );
+    close(console, console);
 }

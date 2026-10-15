@@ -433,10 +433,7 @@ fn smoke(case: &str, marker: &str) -> Result {
         thread::sleep(Duration::from_millis(100));
     };
     let text = fs::read_to_string(&log_path)?;
-    if status.code() != Some(33)
-        || !text.lines().any(|line| line.trim() == marker)
-        || text.contains("PANIC:")
-    {
+    if status.code() != Some(33) || !smoke_output_valid(case, marker, &text) {
         return Err(format!(
             "{case} check failed ({status}); inspect {}",
             log_path.display()
@@ -445,6 +442,16 @@ fn smoke(case: &str, marker: &str) -> Result {
     }
     println!("QEMU {case} passed: {marker}");
     Ok(())
+}
+
+fn smoke_output_valid(case: &str, marker: &str, text: &str) -> bool {
+    let orphan_verified = !matches!(case, "boot" | "spawn")
+        || text
+            .lines()
+            .filter(|line| line.trim() == "service: orphan observed parent closure")
+            .count()
+            == 2;
+    orphan_verified && text.lines().any(|line| line.trim() == marker) && !text.contains("PANIC:")
 }
 
 fn ensure_git_root() -> Result {
@@ -474,4 +481,31 @@ fn doctor() -> Result {
     }
     run(Command::new("rustup").args(["target", "list", "--installed"]))?;
     ensure_git_root()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::smoke_output_valid;
+
+    #[test]
+    fn process_smoke_requires_both_unwatched_child_confirmations() {
+        let marker = "ARKHE_PROCESS_OK";
+        let one = "service: orphan observed parent closure\r\n";
+        assert!(!smoke_output_valid("spawn", marker, marker));
+        assert!(!smoke_output_valid(
+            "spawn",
+            marker,
+            &format!("{one}{marker}")
+        ));
+        let complete = format!("{one}{one}{marker}");
+        assert!(smoke_output_valid("spawn", marker, &complete));
+        assert!(smoke_output_valid("boot", marker, &complete));
+        assert!(!smoke_output_valid(
+            "spawn",
+            marker,
+            &format!("{complete}\nPANIC:")
+        ));
+        assert!(!smoke_output_valid("spawn", marker, &format!("{one}{one}")));
+        assert!(smoke_output_valid("ipc", marker, marker));
+    }
 }

@@ -3,6 +3,8 @@
 
 #[path = "../channels.rs"]
 mod channels;
+#[path = "../grants.rs"]
+mod grants;
 #[path = "../runtime.rs"]
 mod runtime;
 use arkhe_abi::{Error, FAULT_STATUS_BASE, Syscall};
@@ -48,13 +50,12 @@ pub extern "C" fn _start(console: u64, _: u64, root: u64, factory: u64) -> ! {
     check_retained_status(console, image);
     check_process_quota(console, image);
     check_descriptor_quota(console, root, image);
+    grants::check(console, root, image, factory);
     require(
         console,
         call(Syscall::Yield as u64, 0, 0, 0) == 0,
         "supervisor: yield failed\n",
     );
-    let orphan = spawn(image, 0, console);
-    require(console, orphan > 0, "supervisor: orphan launch failed\n");
     let text = b"supervisor: child exit, fault recovery and resource limits verified\n";
     require(
         console,
@@ -66,14 +67,7 @@ pub extern "C" fn _start(console: u64, _: u64, root: u64, factory: u64) -> ! {
         ) == text.len() as i64,
         "supervisor: console failed\n",
     );
-    for handle in [console, root, image] {
-        require(
-            console,
-            call(Syscall::Close as u64, handle, 0, 0) == 0,
-            "supervisor: final handle close failed\n",
-        );
-    }
-    channels::check_exit_cleanup(factory);
+    channels::check_exit_cleanup(console, factory, image);
     exit(0)
 }
 

@@ -107,6 +107,20 @@ impl<const N: usize, T: Copy> CapabilityTable<N, T> {
         Ok(entry.object)
     }
 
+    /// Move one entry with attenuated rights. Failure preserves both tables;
+    /// success retires the source handle without releasing the underlying object.
+    pub fn move_to<const M: usize>(
+        &mut self,
+        handle: Handle,
+        rights: Rights,
+        destination: &mut CapabilityTable<M, T>,
+    ) -> Result<Handle, Error> {
+        let object = self.resolve(handle, rights)?;
+        let moved = destination.insert(object, rights)?;
+        self.remove(handle).expect("validated source capability");
+        Ok(moved)
+    }
+
     pub fn resolve_mut(&mut self, handle: Handle, required: Rights) -> Result<&mut T, Error> {
         self.resolve(handle, required)?;
         self.slots[handle.raw() as u32 as usize]
@@ -157,6 +171,67 @@ impl<const N: usize, T: Copy> CapabilityTable<N, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn move_failure_preserves_source_destination_and_generations() {
+        let mut source = CapabilityTable::<1>::new();
+        let mut destination = CapabilityTable::<1>::new();
+        let old = source.insert(ObjectId(7), Rights::SEND).unwrap();
+        let occupied = destination.insert(ObjectId(9), Rights::READ).unwrap();
+        assert_eq!(
+            source.move_to(old, Rights::RECEIVE, &mut destination),
+            Err(Error::PermissionDenied)
+        );
+        for _ in 0..12 {
+            assert_eq!(
+                source.move_to(old, Rights::SEND, &mut destination),
+                Err(Error::NoSpace)
+            );
+        }
+        assert_eq!(source.resolve(old, Rights::SEND), Ok(ObjectId(7)));
+        assert_eq!(destination.resolve(occupied, Rights::READ), Ok(ObjectId(9)));
+        assert_eq!(source.slots[0].generation, 1);
+        assert_eq!(destination.slots[0].generation, 1);
+        destination.close(occupied).unwrap();
+        destination.slots[0].generation = 0;
+        assert_eq!(
+            source.move_to(old, Rights::SEND, &mut destination),
+            Err(Error::NoSpace)
+        );
+        assert_eq!(
+            source.move_to(old, Rights::SEND, &mut CapabilityTable::<0>::new()),
+            Err(Error::NoSpace)
+        );
+        assert_eq!(source.resolve(old, Rights::SEND), Ok(ObjectId(7)));
+    }
+
+    #[test]
+    fn move_attenuates_rights_and_retires_exhausted_source() {
+        let mut source = CapabilityTable::<1>::new();
+        let mut destination = CapabilityTable::<2>::new();
+        source.slots[0].generation = MAX_GENERATION;
+        let old = source
+            .insert(ObjectId(7), Rights::SEND.union(Rights::RECEIVE))
+            .unwrap();
+        let moved = source.move_to(old, Rights::SEND, &mut destination).unwrap();
+        assert_eq!(source.resolve(old, Rights::SEND), Err(Error::InvalidHandle));
+        assert_eq!(
+            source.move_to(old, Rights::SEND, &mut destination),
+            Err(Error::InvalidHandle)
+        );
+        assert_eq!(
+            source.insert(ObjectId(8), Rights::SEND),
+            Err(Error::NoSpace)
+        );
+        assert_eq!(destination.resolve(moved, Rights::SEND), Ok(ObjectId(7)));
+        assert_eq!(
+            destination.resolve(moved, Rights::RECEIVE),
+            Err(Error::PermissionDenied)
+        );
+        assert_eq!(destination.pop(), Some(ObjectId(7)));
+        assert_eq!(destination.pop(), None);
+        assert_eq!(source.pop(), None);
+    }
 
     #[test]
     fn pair_failure_preserves_entries_and_unpublished_generations() {

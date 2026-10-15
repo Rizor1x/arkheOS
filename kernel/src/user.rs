@@ -274,6 +274,9 @@ pub fn syscall(frame: &mut ExceptionFrame) {
         Ok(Syscall::ProcessSpawn) => {
             frame.result(status(process::spawn(state, slot, a, b, c)));
         }
+        Ok(Syscall::ProcessSpawnWithGrants) => {
+            frame.result(status(process::spawn_with_grants(state, slot, a, b, c)));
+        }
         Ok(Syscall::ChannelCreate) => {
             frame.result(status(ipc::create(state, slot, a, b, c)));
         }
