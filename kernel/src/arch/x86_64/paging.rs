@@ -158,6 +158,75 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Validate every destination page before writing any bytes. IRQs stay masked,
+    /// and only this kernel owns the tables, so the second walk cannot race unmapping.
+    pub fn copy_to_user(&self, address: u64, source: &[u8]) -> Result<(), MapError> {
+        if source.is_empty() {
+            return Ok(());
+        }
+        let end = address
+            .checked_add(source.len() as u64)
+            .ok_or(MapError::InvalidAddress)?;
+        if address < 0x10000 || end > USER_LIMIT {
+            return Err(MapError::InvalidAddress);
+        }
+        let mut done = 0;
+        while done < source.len() {
+            let current = address + done as u64;
+            self.pointer(self.walk(current, true)?)?;
+            done += (source.len() - done).min((PAGE - current % PAGE) as usize);
+        }
+        let mut done = 0;
+        while done < source.len() {
+            let current = address + done as u64;
+            let destination = self.pointer(self.walk(current, true)?)? as *mut u8;
+            let length = (source.len() - done).min((PAGE - current % PAGE) as usize);
+            // SAFETY: Both walks require writable user access at every level. The
+            // source is immutable kernel/module memory, disjoint from process-owned pages.
+            // This BSP cannot change mappings while copying each bounded page chunk.
+            unsafe {
+                core::ptr::copy_nonoverlapping(source[done..].as_ptr(), destination, length);
+            }
+            done += length;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "smoke")]
+    pub fn check_copy_permissions(&mut self) {
+        assert_ne!(
+            active_root(),
+            self.root,
+            "permission probe requires an inactive root"
+        );
+        let address = STACK_TOP - PAGE;
+        let physical = self.walk(address, true).expect("writable test stack");
+        let byte = self.pointer(physical).expect("stack direct map") as *const u8;
+        // SAFETY: This owned, zeroed stack page is inactive and has no Rust references.
+        let before = unsafe { byte.read_volatile() };
+        let mut table = self.root;
+        for shift in [39, 30, 21, 12] {
+            let index = ((address >> shift) & 511) as usize;
+            let original = self.read_entry(table, index).expect("test page table");
+            for permission in [PRESENT, USER, WRITE] {
+                self.write_entry(table, index, original & !permission)
+                    .expect("clear test permission");
+                let result = self.copy_to_user(address, b"x");
+                self.write_entry(table, index, original)
+                    .expect("restore test permission");
+                assert_eq!(
+                    result,
+                    Err(MapError::InvalidAddress),
+                    "copy ignored page permission"
+                );
+                // SAFETY: Restored inactive mappings still own the same physical stack page.
+                let after = unsafe { byte.read_volatile() };
+                assert_eq!(after, before, "failed copy changed destination");
+            }
+            table = original & ADDRESS;
+        }
+    }
+
     fn map<const N: usize>(
         &mut self,
         frames: &mut FramePool<N>,
@@ -198,13 +267,18 @@ impl AddressSpace {
     }
 
     fn translate(&self, address: u64) -> Result<u64, MapError> {
+        self.walk(address, false)
+    }
+
+    fn walk(&self, address: u64, writable: bool) -> Result<u64, MapError> {
         if address >= USER_LIMIT {
             return Err(MapError::InvalidAddress);
         }
         let mut table = self.root;
         for shift in [39, 30, 21, 12] {
             let entry = self.read_entry(table, ((address >> shift) & 511) as usize)?;
-            if entry & (PRESENT | USER) != PRESENT | USER {
+            let required = PRESENT | USER | if writable { WRITE } else { 0 };
+            if entry & required != required {
                 return Err(MapError::InvalidAddress);
             }
             if shift != 12 && entry & HUGE != 0 {

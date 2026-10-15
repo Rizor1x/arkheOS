@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 
 pub const ABI_VERSION: u32 = 1;
+pub const MAX_IO_BYTES: usize = 256;
+pub const MAX_PATH_BYTES: usize = 100;
 pub const MAX_MESSAGE_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +17,8 @@ pub enum Syscall {
     Exit = 5,
     Version = 6,
     ClockTicks = 7,
+    FileOpen = 8,
+    FileRead = 9,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -30,6 +34,8 @@ impl TryFrom<u64> for Syscall {
             5 => Ok(Self::Exit),
             6 => Ok(Self::Version),
             7 => Ok(Self::ClockTicks),
+            8 => Ok(Self::FileOpen),
+            9 => Ok(Self::FileRead),
             _ => Err(Error::Unsupported),
         }
     }
@@ -44,6 +50,7 @@ pub enum Error {
     WouldBlock = -4,
     NoSpace = -5,
     Unsupported = -6,
+    NotFound = -7,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

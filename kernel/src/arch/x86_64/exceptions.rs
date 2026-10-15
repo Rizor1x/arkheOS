@@ -216,7 +216,7 @@ impl ExceptionFrame {
         stack_segment: 27,
     };
 
-    pub fn user(entry: u64, stack: u64, console: u64, role: u64) -> Self {
+    pub fn user(entry: u64, stack: u64, console: u64, role: u64, root: u64) -> Self {
         let mut frame = Self {
             instruction: entry,
             stack_pointer: stack,
@@ -224,6 +224,7 @@ impl ExceptionFrame {
         };
         frame.registers[8] = console;
         frame.registers[9] = role;
+        frame.registers[12] = root;
         frame
     }
 

@@ -3,6 +3,7 @@
 
 pub mod capability;
 pub mod elf;
+pub mod filesystem;
 pub mod frame_pool;
 pub mod initramfs;
 pub mod ipc;

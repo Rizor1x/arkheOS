@@ -114,7 +114,7 @@ impl<'a> Archive<'a> {
     }
 }
 
-fn valid_path(name: &str) -> bool {
+pub(crate) fn valid_path(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('/')
         && !name.contains('\\')

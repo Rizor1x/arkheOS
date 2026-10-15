@@ -1,11 +1,15 @@
 use arkhe_abi::{Error, Handle};
 
+const MAX_GENERATION: u32 = i32::MAX as u32;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Rights(u8);
 
 impl Rights {
     pub const SEND: Self = Self(1);
     pub const RECEIVE: Self = Self(2);
+    pub const READ: Self = Self(4);
+    pub const OPEN: Self = Self(8);
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -20,28 +24,28 @@ impl Rights {
 pub struct ObjectId(pub u64);
 
 #[derive(Clone, Copy)]
-struct Entry {
-    object: ObjectId,
+struct Entry<T: Copy> {
+    object: T,
     rights: Rights,
 }
 
 #[derive(Clone, Copy)]
-struct Slot {
+struct Slot<T: Copy> {
     generation: u32,
-    entry: Option<Entry>,
+    entry: Option<Entry<T>>,
 }
 
-pub struct CapabilityTable<const N: usize> {
-    slots: [Slot; N],
+pub struct CapabilityTable<const N: usize, T: Copy = ObjectId> {
+    slots: [Slot<T>; N],
 }
 
-impl<const N: usize> Default for CapabilityTable<N> {
+impl<const N: usize, T: Copy> Default for CapabilityTable<N, T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const N: usize> CapabilityTable<N> {
+impl<const N: usize, T: Copy> CapabilityTable<N, T> {
     pub const fn new() -> Self {
         Self {
             slots: [Slot {
@@ -51,9 +55,9 @@ impl<const N: usize> CapabilityTable<N> {
         }
     }
 
-    pub fn insert(&mut self, object: ObjectId, rights: Rights) -> Result<Handle, Error> {
+    pub fn insert(&mut self, object: T, rights: Rights) -> Result<Handle, Error> {
         for (index, slot) in self.slots.iter_mut().enumerate() {
-            if slot.entry.is_none() && slot.generation != 0 {
+            if slot.entry.is_none() && slot.generation != 0 && slot.generation <= MAX_GENERATION {
                 let index = u32::try_from(index).map_err(|_| Error::NoSpace)?;
                 slot.entry = Some(Entry { object, rights });
                 return Ok(Handle::from_raw(
@@ -64,7 +68,7 @@ impl<const N: usize> CapabilityTable<N> {
         Err(Error::NoSpace)
     }
 
-    pub fn resolve(&self, handle: Handle, required: Rights) -> Result<ObjectId, Error> {
+    pub fn resolve(&self, handle: Handle, required: Rights) -> Result<T, Error> {
         let slot = self.slot(handle)?;
         let entry = slot.entry.ok_or(Error::InvalidHandle)?;
         if !entry.rights.contains(required) {
@@ -73,16 +77,29 @@ impl<const N: usize> CapabilityTable<N> {
         Ok(entry.object)
     }
 
+    pub fn resolve_mut(&mut self, handle: Handle, required: Rights) -> Result<&mut T, Error> {
+        self.resolve(handle, required)?;
+        self.slots[handle.raw() as u32 as usize]
+            .entry
+            .as_mut()
+            .map(|entry| &mut entry.object)
+            .ok_or(Error::InvalidHandle)
+    }
+
     pub fn close(&mut self, handle: Handle) -> Result<(), Error> {
         self.slot(handle)?;
         let slot = &mut self.slots[handle.raw() as u32 as usize];
         slot.entry = None;
-        // Exhausted generations retire the slot so stale handles never become valid again.
-        slot.generation = slot.generation.checked_add(1).unwrap_or(0);
+        // Retire before wrap or the sign bit: syscall results reserve negative values for errors.
+        slot.generation = slot
+            .generation
+            .checked_add(1)
+            .filter(|generation| *generation <= MAX_GENERATION)
+            .unwrap_or(0);
         Ok(())
     }
 
-    fn slot(&self, handle: Handle) -> Result<&Slot, Error> {
+    fn slot(&self, handle: Handle) -> Result<&Slot<T>, Error> {
         let index = handle.raw() as u32 as usize;
         let generation = (handle.raw() >> 32) as u32;
         let slot = self.slots.get(index).ok_or(Error::InvalidHandle)?;
@@ -114,10 +131,30 @@ mod tests {
     }
 
     #[test]
+    fn mutable_resources_preserve_rights_and_handle_generations() {
+        let mut table = CapabilityTable::<1, usize>::new();
+        let handle = table.insert(10, Rights::READ).unwrap();
+        assert_eq!(
+            table.resolve_mut(handle, Rights::OPEN),
+            Err(Error::PermissionDenied)
+        );
+        *table.resolve_mut(handle, Rights::READ).unwrap() = 20;
+        assert_eq!(table.resolve(handle, Rights::READ), Ok(20));
+        table.close(handle).unwrap();
+        let next = table.insert(30, Rights::OPEN).unwrap();
+        assert_eq!(
+            table.resolve_mut(handle, Rights::READ),
+            Err(Error::InvalidHandle)
+        );
+        assert_eq!(table.resolve(next, Rights::OPEN), Ok(30));
+    }
+
+    #[test]
     fn exhausted_generation_is_never_reused() {
         let mut table = CapabilityTable::<1>::new();
-        table.slots[0].generation = u32::MAX;
+        table.slots[0].generation = MAX_GENERATION;
         let handle = table.insert(ObjectId(1), Rights::SEND).unwrap();
+        assert!(handle.raw() <= i64::MAX as u64);
         table.close(handle).unwrap();
         assert_eq!(table.insert(ObjectId(2), Rights::SEND), Err(Error::NoSpace));
     }

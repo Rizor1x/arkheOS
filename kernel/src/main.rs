@@ -43,7 +43,12 @@ pub extern "C" fn _start() -> ! {
     let executable =
         arkhe_kernel_core::elf::Executable::parse(archive.read("bin/init").expect("bin/init"))
             .expect("invalid init ELF");
-    user::launch(memory.ranges(), memory.direct_map_offset, executable);
+    user::launch(
+        memory.ranges(),
+        memory.direct_map_offset,
+        executable,
+        archive,
+    );
 }
 
 fn check_core() -> Result<(), Error> {

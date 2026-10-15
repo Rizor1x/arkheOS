@@ -1,10 +1,12 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use arkhe_abi::{ABI_VERSION, Error, Handle, Syscall};
-use arkhe_kernel_core::capability::{CapabilityTable, ObjectId, Rights};
+use arkhe_abi::{ABI_VERSION, Error, Handle, MAX_IO_BYTES, MAX_PATH_BYTES, Syscall};
+use arkhe_kernel_core::capability::{CapabilityTable, Rights};
 use arkhe_kernel_core::elf::Executable;
+use arkhe_kernel_core::filesystem::{OpenFile, ReadOnlyFs};
 use arkhe_kernel_core::frame_pool::FramePool;
+use arkhe_kernel_core::initramfs::Archive;
 use arkhe_kernel_core::memory::FrameRange;
 use arkhe_kernel_core::scheduler::Scheduler;
 
@@ -14,14 +16,18 @@ use crate::arch::x86_64::{
     paging::{self, AddressSpace, POOL_FRAMES, STACK_TOP},
 };
 
-const CONSOLE: ObjectId = ObjectId(1);
-const MAX_WRITE: usize = 256;
+#[derive(Clone, Copy)]
+enum Resource {
+    Console,
+    Directory,
+    File(OpenFile<'static>),
+}
 const PROCESSES: usize = 3;
 const ROUNDS: u64 = 2;
 
 struct Process {
     space: AddressSpace,
-    capabilities: CapabilityTable<4>,
+    capabilities: CapabilityTable<8, Resource>,
     context: ExceptionFrame,
     ticks: u64,
 }
@@ -40,6 +46,7 @@ struct State {
     frames: FramePool<POOL_FRAMES>,
     scheduler: Scheduler<PROCESSES>,
     image: Option<Executable<'static>>,
+    filesystem: Option<ReadOnlyFs<'static>>,
     kernel_root: u64,
     direct_map: u64,
     round: u64,
@@ -58,6 +65,7 @@ static STATE: ProcessStorage = ProcessStorage(UnsafeCell::new(State {
     frames: FramePool::new(),
     scheduler: Scheduler::new(),
     image: None,
+    filesystem: None,
     kernel_root: 0,
     direct_map: 0,
     round: 0,
@@ -90,7 +98,12 @@ fn state() -> &'static mut State {
     unsafe { &mut *STATE.0.get() }
 }
 
-pub fn launch(ranges: &[FrameRange], direct_map: u64, elf: Executable<'static>) -> ! {
+pub fn launch(
+    ranges: &[FrameRange],
+    direct_map: u64,
+    elf: Executable<'static>,
+    archive: Archive<'static>,
+) -> ! {
     cpu::disable_interrupts();
     assert!(
         !INITIALIZED.swap(true, Ordering::AcqRel),
@@ -101,9 +114,12 @@ pub fn launch(ranges: &[FrameRange], direct_map: u64, elf: Executable<'static>) 
     state.kernel_root = paging::active_root();
     state.direct_map = direct_map;
     state.image = Some(elf);
+    state.filesystem = Some(ReadOnlyFs::new(archive));
     #[cfg(feature = "smoke")]
     check_load_rollback(state, ranges);
     spawn_round(state);
+    #[cfg(feature = "smoke")]
+    state.processes[0].space.check_copy_permissions();
     let slot = state.scheduler.advance().expect("first runnable process");
     cpu::timer::init();
     cpu::write_console(format_args!(
@@ -151,13 +167,18 @@ fn spawn_round(state: &mut State) {
         process.capabilities = CapabilityTable::new();
         let console = process
             .capabilities
-            .insert(CONSOLE, Rights::SEND)
+            .insert(Resource::Console, Rights::SEND)
             .expect("console capability");
+        let root = process
+            .capabilities
+            .insert(Resource::Directory, Rights::OPEN)
+            .expect("root capability");
         process.context = ExceptionFrame::user(
             state.image.as_ref().expect("init image").entry(),
             STACK_TOP - 8,
             console.raw(),
             role as u64,
+            root.raw(),
         );
         process.ticks = 0;
         state.scheduler.insert(role).expect("vacant process slot");
@@ -189,6 +210,14 @@ pub fn syscall(frame: &mut ExceptionFrame) {
                 Ok(Syscall::ClockTicks) => Ok(cpu::timer::ticks().min(i64::MAX as u64)),
                 Ok(Syscall::Close) => process.capabilities.close(Handle::from_raw(a)).map(|()| 0),
                 Ok(Syscall::DebugWrite) => write(process, a, b, c),
+                Ok(Syscall::FileOpen) => open(
+                    process,
+                    state.filesystem.as_ref().expect("boot filesystem"),
+                    a,
+                    b,
+                    c,
+                ),
+                Ok(Syscall::FileRead) => read(process, a, b, c),
                 _ => Err(Error::Unsupported),
             };
             frame.result(match result {
@@ -259,18 +288,19 @@ fn retire(state: &mut State, frame: &mut ExceptionFrame) {
 }
 
 fn write(process: &Process, handle: u64, pointer: u64, length: u64) -> Result<u64, Error> {
-    if process
-        .capabilities
-        .resolve(Handle::from_raw(handle), Rights::SEND)?
-        != CONSOLE
-    {
+    if !matches!(
+        process
+            .capabilities
+            .resolve(Handle::from_raw(handle), Rights::SEND)?,
+        Resource::Console
+    ) {
         return Err(Error::PermissionDenied);
     }
     let length = usize::try_from(length).map_err(|_| Error::InvalidArgument)?;
-    if length > MAX_WRITE {
+    if length > MAX_IO_BYTES {
         return Err(Error::InvalidArgument);
     }
-    let mut buffer = [0; MAX_WRITE];
+    let mut buffer = [0; MAX_IO_BYTES];
     process
         .space
         .copy_from_user(pointer, &mut buffer[..length])
@@ -278,6 +308,55 @@ fn write(process: &Process, handle: u64, pointer: u64, length: u64) -> Result<u6
     let text = core::str::from_utf8(&buffer[..length]).map_err(|_| Error::InvalidArgument)?;
     cpu::write_console(format_args!("{text}"));
     Ok(length as u64)
+}
+
+fn open(
+    process: &mut Process,
+    fs: &ReadOnlyFs<'static>,
+    root: u64,
+    pointer: u64,
+    length: u64,
+) -> Result<u64, Error> {
+    if !matches!(
+        process
+            .capabilities
+            .resolve(Handle::from_raw(root), Rights::OPEN)?,
+        Resource::Directory
+    ) {
+        return Err(Error::PermissionDenied);
+    }
+    let length = usize::try_from(length).map_err(|_| Error::InvalidArgument)?;
+    if length == 0 || length > MAX_PATH_BYTES {
+        return Err(Error::InvalidArgument);
+    }
+    let mut path = [0; MAX_PATH_BYTES];
+    process
+        .space
+        .copy_from_user(pointer, &mut path[..length])
+        .map_err(|_| Error::InvalidArgument)?;
+    let path = core::str::from_utf8(&path[..length]).map_err(|_| Error::InvalidArgument)?;
+    let file = fs.open(path)?;
+    process
+        .capabilities
+        .insert(Resource::File(file), Rights::READ)
+        .map(Handle::raw)
+}
+
+fn read(process: &mut Process, handle: u64, pointer: u64, length: u64) -> Result<u64, Error> {
+    let length = usize::try_from(length).map_err(|_| Error::InvalidArgument)?;
+    let Resource::File(file) = process
+        .capabilities
+        .resolve_mut(Handle::from_raw(handle), Rights::READ)?
+    else {
+        return Err(Error::PermissionDenied);
+    };
+    file.read_with(length, |bytes| {
+        process
+            .space
+            .copy_to_user(pointer, bytes)
+            .map_err(|_| Error::InvalidArgument)
+    })
+    .map(|count| count as u64)
 }
 
 fn finish(state: &State) -> ! {

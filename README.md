@@ -17,7 +17,8 @@ Implemented:
 - RX user code, RW/NX data and stack, and unmapped stack guard pages;
 - bounded USTAR initramfs with checked headers and indexed file lookup;
 - static ELF64 loading with segment, entry, bounds, and W^X validation;
-- version, console-write, close, yield, timer-tick, and exit calls through `int 0x80`;
+- version, console-write, close, yield, timer-tick, file-open/read, and exit calls
+  through `int 0x80`;
 - page reclamation on exit/fault and rollback of partially loaded executables;
 - host tests and real kernel/user fault injection under BIOS and UEFI QEMU.
 
@@ -80,7 +81,11 @@ register and flag restoration after a returning breakpoint.
 execute privileged instructions, write its RX code, execute its NX stack, or use
 unsupported x87 state. Each fault must leave the other processes running.
 The application also tests invalid/closed handles, unknown calls, pointer
-overflow, unmapped buffers, guard-page crossings, and a valid cross-page copy.
+overflow, unmapped buffers, guard-page crossings, and valid cross-page copies.
+Every application instance opens and reads text and binary files, checks independent
+file positions, stale handles, descriptor exhaustion, and failed-copy rollback.
+Writes into code/kernel memory are rejected; a destination crossing an unmapped
+page must remain unchanged.
 
 `smoke-scheduler` verifies timer preemption of an application that never yields,
 GPR/flag restoration across interrupts, independent writable data, and continued
@@ -120,11 +125,25 @@ The initramfs contains only explicitly selected files, with reproducible metadat
 
 Local Git checks can be installed with `cargo xtask hooks`.
 
+## Filesystem
+
+The current filesystem is a read-only USTAR initramfs supplied by Limine. It contains
+`bin/init` and `etc/motd`. Headers, checksums, paths, bounds, and duplicate names are
+validated before execution. File lookup uses a bounded sorted index; file data stays
+in the retained boot module without an additional extracted copy.
+
+Applications access the namespace through a granted directory capability. Each
+open file has its own cursor, and each process has its own descriptor table.
+Only read access is supported. There is no persistent disk filesystem, disk-write
+path, or writable RAM filesystem yet. A disk format has not been selected;
+block-device support and recovery tests come before that decision.
+
 ## Initial application ABI
 
 Applications are static x86_64 ELF64 executables with a Rust `no_std` runtime.
 The entry function receives its console handle in RDI and the boot-demo role
-in RSI. `userspace/init` provides a complete build and syscall example. The ABI is experimental.
+in RSI, and a read-only namespace handle in RDX. `userspace/init` provides a complete
+build and syscall example. The ABI is experimental.
 
 `int 0x80` takes a call number in RAX and arguments in RDI, RSI, and RDX.
 RAX returns a nonnegative result or a negative `arkhe-abi::Error`; other GPRs are
@@ -139,6 +158,21 @@ thread-local storage are not supported. Software floating point uses the bare Ru
 | Exit | 5 | Exit status; does not return |
 | Version | 6 | Returns `ABI_VERSION` |
 | ClockTicks | 7 | Returns the saturating count of delivered timer interrupts |
+| FileOpen | 8 | Directory handle, UTF-8 path pointer, path length ≤100 bytes; returns a file handle |
+| FileRead | 9 | File handle, writable buffer pointer, length ≤256; returns bytes read |
+
+File paths are relative to the granted boot namespace. Empty/absolute paths,
+`.`/`..` components, repeated separators, backslashes, and control characters
+are rejected. Open returns `NotFound` for absent files and `NoSpace` when the
+process's eight capability slots are full (initially console + namespace + six files).
+Handles are local to a process; closed generations never become valid again.
+
+Read returns 0 at EOF or for length zero; no destination access occurs in those
+cases. Other reads validate every actual destination page for user write access
+before copying anything. Failure preserves both file position and destination
+bytes. Separate opens have independent cursors. Closing the namespace prevents
+further opens through that handle and leaves existing file handles usable.
+These calls are a native interface; POSIX/libc compatibility is not implemented.
 
 Send and Receive remain reserved and return Unsupported. Each application has
 a 16 KiB stack. Exit and user faults release that process’s mappings after CR3
