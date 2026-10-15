@@ -381,7 +381,7 @@ pub fn trigger_test_fault() {
                 core::arch::asm!("mov rax, [{address}]", address = in(reg) TEST_FAULT_ADDRESS, out("rax") _);
             }
         }
-        "ipc" | "ipc-peer-fault" | "idle" | "scheduler" | "user-fpu" | "boot"
+        "ipc" | "ipc-peer-fault" | "idle" | "scheduler" | "user-fpu" | "boot" | "spawn"
         | "user-kernel-read" | "user-cli" | "user-write-code" | "user-exec-stack" => return,
         _ => panic!("unknown fault test"),
     }

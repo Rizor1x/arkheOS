@@ -17,12 +17,24 @@ class BuilderTests(unittest.TestCase):
             executable = directory / "init"
             executable.write_bytes(b"executable")
             first, second = directory / "one.tar", directory / "two.tar"
-            builder.build(first, executable)
-            builder.build(second, executable)
+            builder.build(first, executable, executable, executable)
+            builder.build(second, executable, executable, executable)
             self.assertEqual(first.read_bytes(), second.read_bytes())
             with tarfile.open(first) as archive:
-                self.assertEqual(archive.getnames(), ["bin/init", "etc/motd"])
+                self.assertEqual(archive.getnames(), ["bin/init", "bin/supervisor", "bin/worker", "etc/motd"])
                 self.assertEqual(archive.extractfile("bin/init").read(), b"executable")
                 for member in archive.getmembers():
+                    self.assertEqual(member.mode, 0o555 if member.name.startswith("bin/") else 0o444)
                     self.assertEqual((member.uid, member.gid, member.mtime), (0, 0, 0))
                     self.assertEqual((member.uname, member.gname), ("", ""))
+
+    def test_invalid_image_is_only_in_explicit_test_archive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            executable = directory / "init"
+            executable.write_bytes(b"executable")
+            image = directory / "test.tar"
+            builder.build(image, executable, executable, executable, invalid_executable=True)
+            with tarfile.open(image) as archive:
+                self.assertEqual(archive.extractfile("bin/invalid").read(), b"not an ELF")
+                self.assertEqual(archive.getmember("bin/invalid").mode, 0o555)

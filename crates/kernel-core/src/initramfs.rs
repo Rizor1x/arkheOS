@@ -16,6 +16,7 @@ pub enum ArchiveError {
 struct File<'a> {
     name: &'a str,
     bytes: &'a [u8],
+    executable: bool,
 }
 
 pub struct Archive<'a> {
@@ -29,6 +30,7 @@ impl<'a> Archive<'a> {
             files: [File {
                 name: "",
                 bytes: &[],
+                executable: false,
             }; MAX_FILES],
             count: 0,
         };
@@ -76,6 +78,10 @@ impl<'a> Archive<'a> {
             if !valid_path(name) {
                 return Err(ArchiveError::InvalidPath);
             }
+            let mode = octal(&header[100..108])?;
+            if mode > 0o7777 {
+                return Err(ArchiveError::InvalidHeader);
+            }
             let size = octal(&header[124..136])?;
             let start = offset.checked_add(BLOCK).ok_or(ArchiveError::Truncated)?;
             let data_end = start.checked_add(size).ok_or(ArchiveError::Truncated)?;
@@ -89,7 +95,11 @@ impl<'a> Archive<'a> {
                 .files
                 .get_mut(archive.count)
                 .ok_or(ArchiveError::TooManyFiles)?;
-            *slot = File { name, bytes: data };
+            *slot = File {
+                name,
+                bytes: data,
+                executable: mode & 0o111 != 0,
+            };
             archive.count += 1;
         }
         archive.files[..archive.count].sort_unstable_by(|a, b| a.name.cmp(b.name));
@@ -103,10 +113,16 @@ impl<'a> Archive<'a> {
     }
 
     pub fn read(&self, name: &str) -> Result<&'a [u8], ArchiveError> {
+        self.lookup(name).map(|file| file.bytes)
+    }
+    pub fn executable(&self, name: &str) -> Result<bool, ArchiveError> {
+        self.lookup(name).map(|file| file.executable)
+    }
+    fn lookup(&self, name: &str) -> Result<&File<'a>, ArchiveError> {
         let index = self.files[..self.count]
             .binary_search_by(|file| file.name.cmp(name))
             .map_err(|_| ArchiveError::NotFound)?;
-        Ok(self.files[index].bytes)
+        Ok(&self.files[index])
     }
 
     pub fn file_count(&self) -> usize {
@@ -156,6 +172,7 @@ mod tests {
     fn fixture(name: &str, body: &[u8]) -> Vec<u8> {
         let mut data = vec![0; BLOCK + body.len().div_ceil(BLOCK) * BLOCK + 2 * BLOCK];
         data[..name.len()].copy_from_slice(name.as_bytes());
+        data[100..108].copy_from_slice(b"0000444\0");
         data[124..136].copy_from_slice(format!("{:011o}\0", body.len()).as_bytes());
         data[156] = b'0';
         data[257..263].copy_from_slice(b"ustar\0");
@@ -219,6 +236,30 @@ mod tests {
         assert!(matches!(
             Archive::new(&combined),
             Err(ArchiveError::Duplicate)
+        ));
+    }
+
+    #[test]
+    fn checks_execute_mode_and_rejects_malformed_permissions() {
+        let mut data = fixture("bin/app", b"code");
+        assert_eq!(
+            Archive::new(&data).unwrap().executable("bin/app"),
+            Ok(false)
+        );
+        data[100..108].copy_from_slice(b"0000555\0");
+        fix_checksum(&mut data);
+        assert_eq!(Archive::new(&data).unwrap().executable("bin/app"), Ok(true));
+        data[100..108].copy_from_slice(b"0077777\0");
+        fix_checksum(&mut data);
+        assert!(matches!(
+            Archive::new(&data),
+            Err(ArchiveError::InvalidHeader)
+        ));
+        data[100] = b'9';
+        fix_checksum(&mut data);
+        assert!(matches!(
+            Archive::new(&data),
+            Err(ArchiveError::InvalidHeader)
         ));
     }
 

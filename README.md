@@ -3,10 +3,11 @@
 An experimental x86_64 operating system written in Rust. The project aims for a
 small kernel, isolated system services, native applications, and a desktop interface.
 
-The kernel boots through BIOS or UEFI, loads a static Rust ELF from a read-only
-initramfs, and runs three isolated instances in ring 3. The startup demonstration
-exercises console capabilities, checked system-call buffers, scheduling, and process exit.
-It repeats the launch after reclaiming every process frame.
+The kernel boots through BIOS or UEFI and starts a native Rust supervisor in
+ring 3. The supervisor loads programs from a read-only initramfs, waits for their
+exit, and restarts a child after a deliberate fault. Every program has its own
+address space and capability table. The demonstration repeats after reclaiming
+all process frames and completion records.
 
 Implemented:
 
@@ -20,14 +21,16 @@ Implemented:
 - static ELF64 loading with segment, entry, bounds, and W^X validation;
 - version, console-write, close, yield, timer-tick, file-open/read, and exit calls
   through `int 0x80`;
+- capability-controlled process creation, blocking wait, and retained exit/fault status;
 - page reclamation on exit/fault and rollback of partially loaded executables;
 - host tests and real kernel/user fault injection under BIOS and UEFI QEMU.
 
-Currently the boot demonstration launches a fixed set of processes on one CPU.
-Kernel higher-half mappings are inherited from Limine; APIC, SMP, dynamic channel
-creation, and a general process-creation API are not implemented. Persistent storage,
-Rust `std`, Python, and a desktop are not supported yet. The kernel is experimental
-and is not ready for everyday use.
+Execution uses one CPU with at most four live processes. Kernel higher-half
+mappings are inherited from Limine; APIC, SMP, and dynamic channel creation are
+not implemented. Children receive only an explicitly granted console, without
+namespace or process-creation authority. Persistent storage, Rust `std`, Python,
+and a desktop are not supported yet. The kernel is experimental and is not
+ready for everyday use.
 
 ## Build and run
 
@@ -67,11 +70,12 @@ cargo xtask smoke-exceptions
 cargo xtask smoke-userspace
 cargo xtask smoke-scheduler
 cargo xtask smoke-ipc
+cargo xtask smoke-processes
 ```
 
 `check` runs formatting, Clippy, host tests, kernel/application builds, and ELF
-and repository checks. `smoke` boots the kernel, runs the Rust application, and
-requires successful exits and full frame reclamation within 30 seconds.
+and repository checks. `smoke` boots the kernel and supervisor, verifies child
+outcomes, and requires full resource reclamation within 30 seconds.
 Each userspace test runs two rounds with fresh address spaces. Smoke builds
 also exhaust a small frame pool during ELF loading and require complete rollback.
 
@@ -84,7 +88,7 @@ execute privileged instructions, write its RX code, execute its NX stack, or use
 unsupported x87 state. Each fault must leave the other processes running.
 The application also tests invalid/closed handles, unknown calls, pointer
 overflow, unmapped buffers, guard-page crossings, and valid cross-page copies.
-Every application instance opens and reads text and binary files, checks independent
+Each boundary-test application opens and reads text and binary files, checks independent
 file positions, stale handles, descriptor exhaustion, and failed-copy rollback.
 Writes into code/kernel memory are rejected; a destination crossing an unmapped
 page must remain unchanged.
@@ -99,6 +103,13 @@ small/invalid receive buffers, and sleeps with all tasks blocked. A second case
 faults a peer while receivers wait; they must wake with `PeerClosed`. Every round
 must release all endpoint objects and process frames. Host tests also cover queue
 backpressure, failed-copy rollback, and stale endpoint generations.
+
+`smoke-processes` checks executable authority, malformed ELF rejection, child
+exit/fault status, restart, stale waits, concurrent children, retained completion
+records across slot reuse, and process/descriptor exhaustion. Closing a watcher
+or exiting its parent must let the child finish and release every resource.
+A child without a console must receive no capabilities. These checks also run
+in the normal startup demonstration, except for the malformed-image fixture.
 
 For UEFI, provide a matching firmware code and variables template:
 
@@ -119,7 +130,7 @@ not implemented.
 | `kernel/` | Boot integration, hardware, user mappings, and syscall dispatch |
 | `crates/kernel-core/` | Safe memory, capability, IPC, ELF, and initramfs logic |
 | `crates/abi/` | Initial application interface types |
-| `userspace/init/` | Native Rust `no_std` application and boundary tests |
+| `userspace/init/` | Native Rust supervisor, worker, and boundary tests |
 | `xtask/` | Build, image, and emulator commands |
 | `boot/` | Boot configuration and pinned Limine revision |
 | `tools/`, `tests/` | Validation tools and their tests |
@@ -136,9 +147,10 @@ Local Git checks can be installed with `cargo xtask hooks`.
 ## Filesystem
 
 The current filesystem is a read-only USTAR initramfs supplied by Limine. It contains
-`bin/init` and `etc/motd`. Headers, checksums, paths, bounds, and duplicate names are
-validated before execution. File lookup uses a bounded sorted index; file data stays
-in the retained boot module without an additional extracted copy.
+`bin/supervisor`, `bin/worker`, `bin/init`, and `etc/motd`. Headers, checksums,
+paths, bounds, and duplicate names are validated before execution. File lookup
+uses a bounded sorted index; file data stays in the retained boot module without
+an additional extracted copy.
 
 Applications access the namespace through a granted directory capability. Each
 open file has its own cursor, and each process has its own descriptor table.
@@ -149,10 +161,13 @@ block-device support and recovery tests come before that decision.
 ## Initial application ABI
 
 Applications are static x86_64 ELF64 executables with a Rust `no_std` runtime.
-The entry function receives its console handle in RDI and the boot-demo role
-in RSI, a read-only namespace handle in RDX, an outgoing channel handle in RCX,
-and an incoming channel handle in R8. `userspace/init` provides a complete build
-and syscall example. The ABI is experimental.
+The entry function receives its console handle in RDI, an application argument
+in RSI, a namespace handle in RDX, an outgoing channel handle in RCX, and an
+incoming channel handle in R8. Unavailable grants are zero. The boot supervisor
+receives console and namespace; spawned children receive only the optional
+console. Boundary tests use three boot instances with role numbers and ring
+channels. `userspace/init` provides complete build and syscall examples. The
+ABI is experimental.
 
 `int 0x80` takes a call number in RAX and arguments in RDI, RSI, and RDX.
 RAX returns a nonnegative result or a negative `arkhe-abi::Error`; other GPRs are
@@ -166,18 +181,20 @@ thread-local storage are not supported. Software floating point uses the bare Ru
 | Receive | 2 | Receiver handle, writable buffer pointer, capacity ≤64; blocks until a message or peer closure |
 | Close | 3 | Handle; returns 0 |
 | DebugWrite | 4 | Console handle, UTF-8 buffer pointer, length ≤256; returns bytes written |
-| Exit | 5 | Exit status; does not return |
+| Exit | 5 | Unsigned 32-bit exit status; valid calls do not return |
 | Version | 6 | Returns `ABI_VERSION` |
 | ClockTicks | 7 | Returns the saturating count of delivered timer interrupts |
 | FileOpen | 8 | Directory handle, UTF-8 path pointer, path length ≤100 bytes; returns a file handle |
 | FileRead | 9 | File handle, writable buffer pointer, length ≤256; returns bytes read |
 | SleepTicks | 10 | Relative delivered timer ticks, 0..1000; returns 0 after waking |
+| ProcessSpawn | 11 | Executable file handle, argument, console handle or 0; returns a child watcher handle |
+| ProcessWait | 12 | Child watcher handle, 0, 0; blocks until completion, returns status and consumes the handle |
 
 File paths are relative to the granted boot namespace. Empty/absolute paths,
 `.`/`..` components, repeated separators, backslashes, and control characters
 are rejected. Open returns `NotFound` for absent files and `NoSpace` when the
-process's eight capability slots are full. Initial grants use four slots:
-console, namespace, sender, and receiver. Closing channel ends frees their slots.
+process's eight capability slots are full. The supervisor starts with two grants;
+boundary-test instances start with four. Closing a handle frees its slot.
 Handles are local to a process; closed generations never become valid again.
 
 Read returns 0 at EOF or for length zero; no destination access occurs in those
@@ -186,6 +203,23 @@ before copying anything. Failure preserves both file position and destination
 bytes. Separate opens have independent cursors. Closing the namespace prevents
 further opens through that handle and leaves existing file handles usable.
 These calls are a native interface; POSIX/libc compatibility is not implemented.
+
+Spawning requires an executable file capability. FileOpen grants execute rights
+only for files with an execute mode bit opened through a namespace with spawn
+authority. Read access alone is insufficient. These are native capability rules,
+not POSIX user/group or setuid permissions. File cursor position does not affect
+execution. A child gets zeroed private pages and the explicitly selected console;
+no file, namespace, IPC, or spawn capability is inherited. Invalid images return
+`BadExecutable`; exhausted process/descriptor/record quotas return `NoSpace`,
+and frame exhaustion returns `NoMemory`. Failed creation rolls back reservations.
+
+Wait returns a normal exit code in 0..2³²−1, or `FAULT_STATUS_BASE | vector` for
+an x86 user exception. Waiting consumes the watcher exactly once; waiting again
+returns `InvalidHandle`. Completed status survives execution-slot reuse until
+wait or close. Closing the watcher detaches without killing the child. Parent
+exit closes its watchers; children continue independently. There are eight bounded
+completion records, including running children and uncollected outcomes. There
+is no process kill, arbitrary capability transfer, or `fork`/`exec` interface.
 
 Each boot channel has one sender, one receiver, and a four-message FIFO. Send is
 nonblocking: a full queue returns `WouldBlock`; no receivers returns `PeerClosed`.

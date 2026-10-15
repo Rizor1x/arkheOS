@@ -26,7 +26,7 @@ fn dispatch() -> Result {
     match task {
         "help" if args.len() <= 1 => {
             println!(
-                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|smoke-userspace|smoke-scheduler|smoke-ipc|audit|hooks|doctor>"
+                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|smoke-userspace|smoke-scheduler|smoke-ipc|smoke-processes|audit|hooks|doctor>"
             );
             Ok(())
         }
@@ -37,6 +37,7 @@ fn dispatch() -> Result {
         "iso" => iso(false, "boot").map(|_| ()),
         "run" => run_qemu(),
         "smoke" => smoke("boot", "ARKHE_USER_OK"),
+        "smoke-processes" => smoke("spawn", "ARKHE_PROCESS_OK"),
         "smoke-ipc" => {
             smoke("ipc", "ARKHE_IPC_OK")?;
             smoke("ipc-peer-fault", "ARKHE_IPC_PEER_FAULT_OK")
@@ -185,13 +186,13 @@ fn build_userspace(case: &str) -> Result<PathBuf> {
             "RUSTFLAGS",
             "-C relocation-model=static -C code-model=small",
         ))?;
-    let executable = Path::new(&directory)
-        .join(TARGET)
-        .join("release/arkhe-init");
-    run(Command::new("python3")
-        .arg("tools/check_elf.py")
-        .arg(&executable))?;
-    Ok(executable)
+    let binaries = Path::new(&directory).join(TARGET).join("release");
+    for name in ["arkhe-init", "arkhe-supervisor", "arkhe-worker"] {
+        run(Command::new("python3")
+            .arg("tools/check_elf.py")
+            .arg(binaries.join(name)))?;
+    }
+    Ok(binaries)
 }
 
 fn lock_value(key: &str) -> Result<String> {
@@ -286,11 +287,18 @@ fn iso(smoke: bool, case: &str) -> Result<PathBuf> {
     fs::create_dir_all(&boot)?;
     fs::create_dir_all(&efi)?;
     fs::copy(kernel, staging.join("boot/arkhe-kernel"))?;
-    let executable = build_userspace(case)?;
-    run(Command::new("python3")
+    let binaries = build_userspace(case)?;
+    let mut archive = Command::new("python3");
+    archive
         .arg("tools/mkinitramfs.py")
         .arg(staging.join("boot/initramfs.tar"))
-        .arg(executable))?;
+        .arg(binaries.join("arkhe-init"))
+        .arg(binaries.join("arkhe-supervisor"))
+        .arg(binaries.join("arkhe-worker"));
+    if smoke && case == "spawn" {
+        archive.arg("--invalid-executable");
+    }
+    run(&mut archive)?;
     fs::copy("boot/limine.conf", boot.join("limine.conf"))?;
     for file in [
         "limine-bios.sys",

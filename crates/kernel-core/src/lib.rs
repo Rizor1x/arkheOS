@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
+pub mod completion;
 pub mod elf;
 pub mod endpoint;
 pub mod filesystem;

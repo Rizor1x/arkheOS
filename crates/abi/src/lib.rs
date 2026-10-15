@@ -1,6 +1,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+/// Wait outcomes below this value are exit codes; faults OR it with the x86 vector.
+pub const FAULT_STATUS_BASE: u64 = 1 << 32;
 pub const ABI_VERSION: u32 = 1;
 pub const MAX_IO_BYTES: usize = 256;
 pub const MAX_PATH_BYTES: usize = 100;
@@ -20,6 +22,8 @@ pub enum Syscall {
     FileOpen = 8,
     FileRead = 9,
     SleepTicks = 10,
+    ProcessSpawn = 11,
+    ProcessWait = 12,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -38,6 +42,8 @@ impl TryFrom<u64> for Syscall {
             8 => Ok(Self::FileOpen),
             9 => Ok(Self::FileRead),
             10 => Ok(Self::SleepTicks),
+            11 => Ok(Self::ProcessSpawn),
+            12 => Ok(Self::ProcessWait),
             _ => Err(Error::Unsupported),
         }
     }
@@ -55,6 +61,8 @@ pub enum Error {
     NotFound = -7,
     PeerClosed = -8,
     BufferTooSmall = -9,
+    BadExecutable = -10,
+    NoMemory = -11,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

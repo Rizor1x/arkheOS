@@ -10,6 +10,9 @@ impl Rights {
     pub const RECEIVE: Self = Self(2);
     pub const READ: Self = Self(4);
     pub const OPEN: Self = Self(8);
+    pub const EXECUTE: Self = Self(16);
+    pub const SPAWN: Self = Self(32);
+    pub const WAIT: Self = Self(64);
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)

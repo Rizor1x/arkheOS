@@ -40,9 +40,14 @@ pub extern "C" fn _start() -> ! {
         "initramfs: {} files, indexed read-only\n",
         archive.file_count()
     ));
+    let path = if matches!(env!("ARKHE_TEST_CASE"), "boot" | "spawn") {
+        "bin/supervisor"
+    } else {
+        "bin/init"
+    };
     let executable =
-        arkhe_kernel_core::elf::Executable::parse(archive.read("bin/init").expect("bin/init"))
-            .expect("invalid init ELF");
+        arkhe_kernel_core::elf::Executable::parse(archive.read(path).expect("boot program"))
+            .expect("invalid boot ELF");
     user::launch(
         memory.ranges(),
         memory.direct_map_offset,

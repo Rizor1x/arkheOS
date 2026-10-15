@@ -32,6 +32,9 @@ impl<const N: usize> Scheduler<N> {
         *state = State::Runnable;
         Ok(())
     }
+    pub fn vacant_slot(&self) -> Option<usize> {
+        self.slots.iter().position(|s| *s == State::Vacant)
+    }
     pub fn current(&self) -> Option<usize> {
         self.current
     }
@@ -93,6 +96,7 @@ mod tests {
     #[test]
     fn rejects_invalid_transitions_and_allows_explicit_slot_reuse() {
         let mut scheduler = Scheduler::<2>::new();
+        assert_eq!(scheduler.vacant_slot(), Some(0));
         assert_eq!(scheduler.remove_current(), None);
         assert_eq!(scheduler.insert(2), Err(ScheduleError::InvalidSlot));
         scheduler.insert(1).unwrap();
@@ -104,6 +108,7 @@ mod tests {
         assert_eq!(scheduler.advance(), Some(1));
         let mut empty = Scheduler::<0>::new();
         assert_eq!(empty.advance(), None);
+        assert_eq!(empty.vacant_slot(), None);
         assert_eq!(empty.insert(0), Err(ScheduleError::InvalidSlot));
     }
     #[test]
@@ -111,6 +116,7 @@ mod tests {
         let mut scheduler = Scheduler::<2>::new();
         scheduler.insert(0).unwrap();
         scheduler.insert(1).unwrap();
+        assert_eq!(scheduler.vacant_slot(), None);
         assert_eq!(scheduler.advance(), Some(0));
         assert_eq!(scheduler.block_current(), Some(0));
         assert_eq!(scheduler.current(), Some(1));
@@ -118,6 +124,7 @@ mod tests {
         assert_eq!(scheduler.block_current(), Some(1));
         assert_eq!(scheduler.advance(), None);
         assert_eq!(scheduler.live_count(), 2);
+        assert_eq!(scheduler.vacant_slot(), None);
         assert_eq!(scheduler.insert(0), Err(ScheduleError::Occupied));
         scheduler.wake(0).unwrap();
         assert_eq!(scheduler.wake(0), Err(ScheduleError::InvalidState));

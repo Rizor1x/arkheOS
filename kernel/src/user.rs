@@ -1,10 +1,14 @@
 mod ipc;
+mod process;
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use arkhe_abi::{ABI_VERSION, Error, Handle, MAX_IO_BYTES, MAX_PATH_BYTES, Syscall};
+use arkhe_abi::{
+    ABI_VERSION, Error, FAULT_STATUS_BASE, Handle, MAX_IO_BYTES, MAX_PATH_BYTES, Syscall,
+};
 use arkhe_kernel_core::capability::{CapabilityTable, Rights};
+use arkhe_kernel_core::completion::{CompletionId, Completions};
 use arkhe_kernel_core::elf::Executable;
 use arkhe_kernel_core::endpoint::{EndpointId, Endpoints};
 use arkhe_kernel_core::filesystem::{OpenFile, ReadOnlyFs};
@@ -22,16 +26,22 @@ use crate::arch::x86_64::{
 #[derive(Clone, Copy)]
 enum Resource {
     Console,
+    Child(CompletionId),
     Directory,
     File(OpenFile<'static>),
     Sender(EndpointId),
     Receiver(EndpointId),
 }
-const PROCESSES: usize = 3;
+const BOOT_PROCESSES: usize = 3;
+const PROCESSES: usize = 4;
 const ROUNDS: u64 = 2;
 
 #[derive(Clone, Copy)]
 enum Wait {
+    Child {
+        completion: CompletionId,
+        handle: Handle,
+    },
     Receive {
         endpoint: EndpointId,
         pointer: u64,
@@ -47,6 +57,7 @@ struct Process {
     capabilities: CapabilityTable<8, Resource>,
     context: ExceptionFrame,
     ticks: u64,
+    completion: Option<CompletionId>,
     wait: Option<Wait>,
 }
 impl Process {
@@ -56,6 +67,7 @@ impl Process {
             capabilities: CapabilityTable::new(),
             context: ExceptionFrame::EMPTY,
             ticks: 0,
+            completion: None,
             wait: None,
         }
     }
@@ -64,7 +76,9 @@ struct State {
     processes: [Process; PROCESSES],
     frames: FramePool<POOL_FRAMES>,
     scheduler: Scheduler<PROCESSES>,
-    endpoints: Endpoints<PROCESSES, 4>,
+    endpoints: Endpoints<BOOT_PROCESSES, 4>,
+    completions: Completions<8>,
+    spawned: usize,
     blocks: u64,
     wakes: u64,
     idle_entries: u64,
@@ -88,6 +102,8 @@ static STATE: ProcessStorage = ProcessStorage(UnsafeCell::new(State {
     frames: FramePool::new(),
     scheduler: Scheduler::new(),
     endpoints: Endpoints::new(),
+    completions: Completions::new(),
+    spawned: 0,
     blocks: 0,
     wakes: 0,
     idle_entries: 0,
@@ -151,7 +167,7 @@ pub fn launch(
         let slot = state.scheduler.advance().expect("first runnable process");
         cpu::timer::init();
         cpu::write_console(format_args!(
-            "scheduler: three isolated Rust processes, timer ~100 Hz\n"
+            "scheduler: isolated Rust userspace, timer ~100 Hz\n"
         ));
         let process = &state.processes[slot];
 
@@ -185,9 +201,15 @@ fn check_load_rollback(state: &mut State, ranges: &[FrameRange]) {
 fn spawn_round(state: &mut State) {
     assert_eq!(state.frames.live_count(), 0, "previous round leaked frames");
     assert_eq!(state.endpoints.live_count(), 0, "endpoint leak");
-    let endpoints: [EndpointId; PROCESSES] =
+    assert_eq!(state.completions.live_count(), 0, "completion leak");
+    if supervised() {
+        process::launch_supervisor(state);
+        state.round += 1;
+        return;
+    }
+    let endpoints: [EndpointId; BOOT_PROCESSES] =
         core::array::from_fn(|_| state.endpoints.create().expect("endpoint quota"));
-    for (role, process) in state.processes.iter_mut().enumerate() {
+    for (role, process) in state.processes.iter_mut().take(BOOT_PROCESSES).enumerate() {
         // SAFETY: The pool exclusively owns usable RAM. The BSP has not started APs;
         // supervisor mappings remain shared, and this process is not yet runnable.
         unsafe {
@@ -210,7 +232,7 @@ fn spawn_round(state: &mut State) {
         let sender = process
             .capabilities
             .insert(
-                Resource::Sender(endpoints[(role + 1) % PROCESSES]),
+                Resource::Sender(endpoints[(role + 1) % BOOT_PROCESSES]),
                 Rights::SEND,
             )
             .expect("send capability");
@@ -240,9 +262,23 @@ pub fn syscall(frame: &mut ExceptionFrame) {
     let [number, a, b, c] = frame.arguments();
     match Syscall::try_from(number) {
         Ok(Syscall::Exit) => {
+            if a > u64::from(u32::MAX) {
+                frame.result(Error::InvalidArgument as i64);
+                return;
+            }
             cpu::write_console(format_args!("process {slot}: exited with status {a}\n"));
-            state.failed |= a != 0;
-            retire(state, frame);
+            state.failed |= a != 0 && state.processes[slot].completion.is_none();
+            retire(state, frame, a);
+        }
+        Ok(Syscall::ProcessSpawn) => {
+            frame.result(status(process::spawn(state, slot, a, b, c)));
+        }
+        Ok(Syscall::ProcessWait) => {
+            if b != 0 || c != 0 {
+                frame.result(Error::InvalidArgument as i64);
+            } else {
+                process::wait(state, frame, slot, Handle::from_raw(a));
+            }
         }
         Ok(Syscall::Yield) => {
             frame.result(0);
@@ -263,7 +299,7 @@ pub fn syscall(frame: &mut ExceptionFrame) {
                 .capabilities
                 .remove(Handle::from_raw(a))
                 .map(|resource| {
-                    if ipc::release(state, resource) {
+                    if release(state, resource) {
                         ipc::wake_receivers(state);
                     }
                     0
@@ -334,7 +370,7 @@ pub fn on_timer(frame: &mut ExceptionFrame) {
             cpu::write_console(format_args!(
                 "scheduler: stopped non-cooperative test process\n"
             ));
-            retire(state, frame);
+            retire(state, frame, 0);
             return;
         }
         state.processes[slot].context = *frame;
@@ -380,14 +416,24 @@ fn restore(state: &mut State, frame: &mut ExceptionFrame) {
     }
 }
 
-fn retire(state: &mut State, frame: &mut ExceptionFrame) {
+fn retire(state: &mut State, frame: &mut ExceptionFrame, outcome: u64) {
     let slot = state.scheduler.remove_current().expect("live process");
-    state.completed += 1;
+    state.completed = state
+        .completed
+        .checked_add(1)
+        .expect("completed process count");
     state.processes[slot].wait = None;
     while let Some(resource) = state.processes[slot].capabilities.pop() {
-        ipc::release(state, resource);
+        release(state, resource);
     }
     ipc::wake_receivers(state);
+    if let Some(id) = state.processes[slot].completion.take() {
+        state
+            .completions
+            .complete(id, outcome)
+            .expect("child completion");
+        process::wake_waiters(state);
+    }
     if state.scheduler.current().is_none() {
         state.scheduler.advance();
     }
@@ -404,6 +450,7 @@ fn retire(state: &mut State, frame: &mut ExceptionFrame) {
     state.processes[slot].capabilities = CapabilityTable::new();
     if state.scheduler.live_count() == 0 {
         assert_eq!(state.endpoints.live_count(), 0, "endpoint leak");
+        assert_eq!(state.completions.live_count(), 0, "completion leak");
         assert_eq!(state.frames.live_count(), 0, "process frame leak");
         cpu::write_console(format_args!(
             "memory: round {} reclaimed all process frames\n",
@@ -468,9 +515,19 @@ fn open(
         .map_err(|_| Error::InvalidArgument)?;
     let path = core::str::from_utf8(&path[..length]).map_err(|_| Error::InvalidArgument)?;
     let file = fs.open(path)?;
+    let rights = if file.executable().is_some()
+        && process
+            .capabilities
+            .resolve(Handle::from_raw(root), Rights::SPAWN)
+            .is_ok()
+    {
+        Rights::READ.union(Rights::EXECUTE)
+    } else {
+        Rights::READ
+    };
     process
         .capabilities
-        .insert(Resource::File(file), Rights::READ)
+        .insert(Resource::File(file), rights)
         .map(Handle::raw)
 }
 
@@ -492,7 +549,14 @@ fn read(process: &mut Process, handle: u64, pointer: u64, length: u64) -> Result
 }
 
 fn finish(state: &State) {
-    assert_eq!(state.completed, PROCESSES * ROUNDS as usize);
+    let initial = if supervised() { 1 } else { BOOT_PROCESSES };
+    assert_eq!(
+        state.completed,
+        state
+            .spawned
+            .checked_add(initial * ROUNDS as usize)
+            .expect("process count")
+    );
     cpu::write_console(format_args!(
         "scheduler: all processes stopped; preemptions={}, yields={}, blocks={}, wakes={}, idle={}\n",
         state.preemptions, state.yields, state.blocks, state.wakes, state.idle_entries
@@ -500,7 +564,7 @@ fn finish(state: &State) {
     #[cfg(feature = "smoke")]
     {
         let case = env!("ARKHE_TEST_CASE");
-        let expected = if matches!(case, "boot" | "scheduler" | "idle" | "ipc") {
+        let expected = if matches!(case, "boot" | "spawn" | "scheduler" | "idle" | "ipc") {
             0
         } else {
             ROUNDS as usize
@@ -520,6 +584,7 @@ fn finish(state: &State) {
         }
         let marker = match case {
             "boot" => "ARKHE_USER_OK",
+            "spawn" => "ARKHE_PROCESS_OK",
             "ipc" => "ARKHE_IPC_OK",
             "ipc-peer-fault" => "ARKHE_IPC_PEER_FAULT_OK",
             "scheduler" if state.preemptions >= 16 => "ARKHE_SCHEDULER_OK",
@@ -554,10 +619,26 @@ pub fn fault(frame: &mut ExceptionFrame, vector: u64, error: u64, address: u64) 
                         | ("user-exec-stack", 14, 0x15)
                         | ("user-fpu", 7, 0)
                 );
-    if expected {
-        state.expected_faults += 1;
-    } else {
-        state.failed = true;
+    // Managed children report faults to their watcher; the supervisor chooses recovery.
+    if state.processes[slot].completion.is_none() {
+        if expected {
+            state.expected_faults += 1;
+        } else {
+            state.failed = true;
+        }
     }
-    retire(state, frame);
+    retire(state, frame, FAULT_STATUS_BASE | vector);
+}
+
+fn supervised() -> bool {
+    matches!(env!("ARKHE_TEST_CASE"), "boot" | "spawn")
+}
+
+fn release(state: &mut State, resource: Resource) -> bool {
+    if let Resource::Child(id) = resource {
+        state.completions.detach(id).expect("owned child watcher");
+        false
+    } else {
+        ipc::release(state, resource)
+    }
 }

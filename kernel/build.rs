@@ -8,6 +8,7 @@ fn main() {
     assert!(matches!(
         case.as_str(),
         "boot"
+            | "spawn"
             | "ipc"
             | "ipc-peer-fault"
             | "scheduler"

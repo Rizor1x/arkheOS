@@ -155,6 +155,10 @@ pub fn check(console: u64, root: u64) {
     close(b);
 
     let executable = opened(open(root, b"bin/init"));
+    expect(
+        call(Syscall::ProcessSpawn as u64, executable, 0, console),
+        Error::PermissionDenied as i64,
+    );
     expect(read(executable, destination, 4), 4);
     for (index, byte) in b"\x7fELF".iter().enumerate() {
         if BUFFER.0[4093 + index].load(Ordering::Relaxed) != *byte {

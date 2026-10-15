@@ -14,5 +14,17 @@ name = "arkhe-init"
 test = false
 bench = false
 
+[[bin]]
+name = "arkhe-supervisor"
+path = "src/bin/supervisor.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "arkhe-worker"
+path = "src/bin/worker.rs"
+test = false
+bench = false
+
 [lints]
 workspace = true

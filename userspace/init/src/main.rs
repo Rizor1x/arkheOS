@@ -3,6 +3,9 @@
 
 mod files;
 mod ipc;
+mod runtime;
+
+use runtime::{call, exit};
 
 use arkhe_abi::{ABI_VERSION, Error, Syscall};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -21,17 +24,6 @@ const fn cross_page() -> [u8; 8192] {
         i += 1;
     }
     bytes
-}
-
-fn call(number: u64, a: u64, b: u64, c: u64) -> i64 {
-    let result: u64;
-    // SAFETY: Gate 0x80 implements the arkhe ABI and preserves all registers
-    // except RAX, which returns a signed status. Buffer arguments remain borrowed.
-    unsafe {
-        core::arch::asm!("int 0x80", inlateout("rax") number => result,
-            in("rdi") a, in("rsi") b, in("rdx") c);
-    }
-    result as i64
 }
 
 #[unsafe(no_mangle)]
@@ -179,13 +171,6 @@ fn check_registers() {
     }
     if valid & 0xff != 1 {
         exit(1);
-    }
-}
-
-fn exit(status: u64) -> ! {
-    call(Syscall::Exit as u64, status, 0, 0);
-    loop {
-        core::hint::spin_loop();
     }
 }
 

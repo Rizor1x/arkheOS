@@ -20,7 +20,15 @@ impl<'a> ReadOnlyFs<'a> {
             ArchiveError::NotFound => Error::NotFound,
             _ => Error::InvalidArgument,
         })?;
-        Ok(OpenFile { bytes, position: 0 })
+        let executable = self
+            .archive
+            .executable(path)
+            .map_err(|_| Error::InvalidArgument)?;
+        Ok(OpenFile {
+            bytes,
+            position: 0,
+            executable,
+        })
     }
 }
 
@@ -28,9 +36,14 @@ impl<'a> ReadOnlyFs<'a> {
 pub struct OpenFile<'a> {
     bytes: &'a [u8],
     position: usize,
+    executable: bool,
 }
 
-impl OpenFile<'_> {
+impl<'a> OpenFile<'a> {
+    pub fn executable(&self) -> Option<&'a [u8]> {
+        self.executable.then_some(self.bytes)
+    }
+
     /// Advance only after the whole bounded chunk has reached its destination.
     /// At EOF or for length zero, the callback receives an empty slice.
     pub fn read_with(
@@ -58,6 +71,7 @@ mod tests {
         let mut file = OpenFile {
             bytes: b"hello",
             position: 0,
+            executable: false,
         };
         assert_eq!(
             file.read_with(0, |data| {
@@ -76,6 +90,7 @@ mod tests {
         let mut independent = OpenFile {
             bytes: file.bytes,
             position: 0,
+            executable: false,
         };
         independent
             .read_with(1, |data| {
@@ -104,6 +119,7 @@ mod tests {
         let mut file = OpenFile {
             bytes: b"abc",
             position: 0,
+            executable: false,
         };
         assert_eq!(
             file.read_with(2, |_| Err(Error::InvalidArgument)),
