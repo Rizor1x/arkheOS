@@ -12,7 +12,8 @@ Implemented:
 
 - COM1 console, GDT/TSS/IDT, and dedicated exception stacks;
 - validated usable RAM ranges, owned frame leases, and per-process page tables;
-- single-CPU round-robin preemption, voluntary yield, and an interrupt-driven idle path;
+- single-CPU round-robin preemption, voluntary yield, timer sleep, and interrupt-driven idle;
+- capability-checked message delivery, blocked receivers, and peer-close wakeups;
 - legacy PC PIC/PIT timer at approximately 100 Hz;
 - RX user code, RW/NX data and stack, and unmapped stack guard pages;
 - bounded USTAR initramfs with checked headers and indexed file lookup;
@@ -23,8 +24,8 @@ Implemented:
 - host tests and real kernel/user fault injection under BIOS and UEFI QEMU.
 
 Currently the boot demonstration launches a fixed set of processes on one CPU.
-Kernel higher-half mappings are inherited from Limine; APIC, SMP, blocking IPC,
-and a general process-creation API are not implemented. Persistent storage,
+Kernel higher-half mappings are inherited from Limine; APIC, SMP, dynamic channel
+creation, and a general process-creation API are not implemented. Persistent storage,
 Rust `std`, Python, and a desktop are not supported yet. The kernel is experimental
 and is not ready for everyday use.
 
@@ -65,6 +66,7 @@ cargo xtask smoke
 cargo xtask smoke-exceptions
 cargo xtask smoke-userspace
 cargo xtask smoke-scheduler
+cargo xtask smoke-ipc
 ```
 
 `check` runs formatting, Clippy, host tests, kernel/application builds, and ELF
@@ -92,6 +94,12 @@ GPR/flag restoration across interrupts, independent writable data, and continued
 execution of other processes. A separate case requires timer interrupts to wake
 the idle kernel after every process has exited.
 
+`smoke-ipc` exchanges binary and empty messages between three processes, checks
+small/invalid receive buffers, and sleeps with all tasks blocked. A second case
+faults a peer while receivers wait; they must wake with `PeerClosed`. Every round
+must release all endpoint objects and process frames. Host tests also cover queue
+backpressure, failed-copy rollback, and stale endpoint generations.
+
 For UEFI, provide a matching firmware code and variables template:
 
 ```sh
@@ -116,8 +124,8 @@ not implemented.
 | `boot/` | Boot configuration and pinned Limine revision |
 | `tools/`, `tests/` | Validation tools and their tests |
 
-The portable libraries are `no_std` and forbid unsafe code. The IPC queue is a
-kernel model; cross-process IPC has not been implemented.
+The portable libraries are `no_std` and forbid unsafe code. Endpoint queues and
+scheduling transitions are host-tested; user-copy and wakeup integration run in QEMU.
 
 Generated files stay in `target/`, `build/`, and `.cache/`. `cargo xtask iso`
 builds `build/normal/arkheOS.iso`; each smoke case uses a separate build directory.
@@ -142,8 +150,9 @@ block-device support and recovery tests come before that decision.
 
 Applications are static x86_64 ELF64 executables with a Rust `no_std` runtime.
 The entry function receives its console handle in RDI and the boot-demo role
-in RSI, and a read-only namespace handle in RDX. `userspace/init` provides a complete
-build and syscall example. The ABI is experimental.
+in RSI, a read-only namespace handle in RDX, an outgoing channel handle in RCX,
+and an incoming channel handle in R8. `userspace/init` provides a complete build
+and syscall example. The ABI is experimental.
 
 `int 0x80` takes a call number in RAX and arguments in RDI, RSI, and RDX.
 RAX returns a nonnegative result or a negative `arkhe-abi::Error`; other GPRs are
@@ -153,6 +162,8 @@ thread-local storage are not supported. Software floating point uses the bare Ru
 | Call | Number | Arguments and result |
 | --- | --- | --- |
 | Yield | 0 | Gives other runnable processes a turn; returns 0 |
+| Send | 1 | Sender handle, payload pointer, length ≤64; returns bytes queued |
+| Receive | 2 | Receiver handle, writable buffer pointer, capacity ≤64; blocks until a message or peer closure |
 | Close | 3 | Handle; returns 0 |
 | DebugWrite | 4 | Console handle, UTF-8 buffer pointer, length ≤256; returns bytes written |
 | Exit | 5 | Exit status; does not return |
@@ -160,11 +171,13 @@ thread-local storage are not supported. Software floating point uses the bare Ru
 | ClockTicks | 7 | Returns the saturating count of delivered timer interrupts |
 | FileOpen | 8 | Directory handle, UTF-8 path pointer, path length ≤100 bytes; returns a file handle |
 | FileRead | 9 | File handle, writable buffer pointer, length ≤256; returns bytes read |
+| SleepTicks | 10 | Relative delivered timer ticks, 0..1000; returns 0 after waking |
 
 File paths are relative to the granted boot namespace. Empty/absolute paths,
 `.`/`..` components, repeated separators, backslashes, and control characters
 are rejected. Open returns `NotFound` for absent files and `NoSpace` when the
-process's eight capability slots are full (initially console + namespace + six files).
+process's eight capability slots are full. Initial grants use four slots:
+console, namespace, sender, and receiver. Closing channel ends frees their slots.
 Handles are local to a process; closed generations never become valid again.
 
 Read returns 0 at EOF or for length zero; no destination access occurs in those
@@ -174,10 +187,27 @@ bytes. Separate opens have independent cursors. Closing the namespace prevents
 further opens through that handle and leaves existing file handles usable.
 These calls are a native interface; POSIX/libc compatibility is not implemented.
 
-Send and Receive remain reserved and return Unsupported. Each application has
-a 16 KiB stack. Exit and user faults release that process’s mappings after CR3
+Each boot channel has one sender, one receiver, and a four-message FIFO. Send is
+nonblocking: a full queue returns `WouldBlock`; no receivers returns `PeerClosed`.
+Receive returns the message length. Empty queues block without polling; the whole
+advertised buffer is checked before waiting. A small buffer returns `BufferTooSmall`
+and leaves the message queued. Copy failure also leaves the queue unchanged.
+Zero-length messages are supported. A zero-length send or a receive with
+capacity zero ignores its buffer pointer.
+
+Closing the sender allows queued data to drain, then wakes receivers with
+`PeerClosed`. Closing the receiver discards its queue and prevents further sends.
+Exit and user faults close every owned endpoint. Slots carry nonwrapping
+generations and cannot be reused through stale endpoint IDs. Boot grants form a
+three-process ring; channel creation, duplication, capability transfer, shared
+memory, and RPC reply capabilities are not implemented.
+
+Each application has a 16 KiB stack. Exit and user faults release that process’s mappings after CR3
 has switched away; the remaining runnable processes continue. The frame pool
 tracks at most 4,096 frames, with at most 1,100 owned frames per address space.
 Reused pages are zeroed before loading. Timer ticks are a scheduling counter,
 not an accurate wall clock: interrupts can coalesce while the kernel masks IRQs.
-Kernel handlers run without preemption; blocking inside a syscall is not supported.
+Kernel handlers run without preemption. Blocking calls save a user continuation
+and select another context; no borrowed Rust state or kernel call stack is parked
+across an interrupt-enabled idle period. Idle uses a separate stack and wakes
+sleeping tasks through the timer.

@@ -2,6 +2,7 @@
 #![no_main]
 
 mod files;
+mod ipc;
 
 use arkhe_abi::{ABI_VERSION, Error, Syscall};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -34,7 +35,7 @@ fn call(number: u64, a: u64, b: u64, c: u64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(console: u64, role: u64, root: u64) -> ! {
+pub extern "C" fn _start(console: u64, role: u64, root: u64, sender: u64, receiver: u64) -> ! {
     if BSS.load(Ordering::Relaxed) != 0 {
         exit(1);
     }
@@ -81,6 +82,7 @@ pub extern "C" fn _start(console: u64, role: u64, root: u64) -> ! {
     {
         exit(1);
     }
+    ipc::check(console, role, sender, receiver);
     files::check(console, root);
     if env!("ARKHE_TEST_CASE") == "scheduler" {
         if role == 0 {

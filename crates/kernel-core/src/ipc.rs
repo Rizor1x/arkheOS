@@ -31,6 +31,13 @@ impl<const N: usize> MessageQueue<N> {
         Ok(())
     }
 
+    pub fn front(&self) -> Result<Message, Error> {
+        if self.len == 0 {
+            return Err(Error::WouldBlock);
+        }
+        self.slots[self.head].ok_or(Error::WouldBlock)
+    }
+
     pub fn receive(&mut self) -> Result<Message, Error> {
         if self.len == 0 {
             return Err(Error::WouldBlock);

@@ -19,6 +19,7 @@ pub enum Syscall {
     ClockTicks = 7,
     FileOpen = 8,
     FileRead = 9,
+    SleepTicks = 10,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -36,6 +37,7 @@ impl TryFrom<u64> for Syscall {
             7 => Ok(Self::ClockTicks),
             8 => Ok(Self::FileOpen),
             9 => Ok(Self::FileRead),
+            10 => Ok(Self::SleepTicks),
             _ => Err(Error::Unsupported),
         }
     }
@@ -51,6 +53,8 @@ pub enum Error {
     NoSpace = -5,
     Unsupported = -6,
     NotFound = -7,
+    PeerClosed = -8,
+    BufferTooSmall = -9,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

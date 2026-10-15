@@ -87,16 +87,30 @@ impl<const N: usize, T: Copy> CapabilityTable<N, T> {
     }
 
     pub fn close(&mut self, handle: Handle) -> Result<(), Error> {
+        self.remove(handle).map(|_| ())
+    }
+
+    pub fn remove(&mut self, handle: Handle) -> Result<T, Error> {
         self.slot(handle)?;
         let slot = &mut self.slots[handle.raw() as u32 as usize];
-        slot.entry = None;
+        let object = slot.entry.take().ok_or(Error::InvalidHandle)?.object;
         // Retire before wrap or the sign bit: syscall results reserve negative values for errors.
         slot.generation = slot
             .generation
             .checked_add(1)
             .filter(|generation| *generation <= MAX_GENERATION)
             .unwrap_or(0);
-        Ok(())
+        Ok(object)
+    }
+
+    pub fn pop(&mut self) -> Option<T> {
+        let (index, slot) = self
+            .slots
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| slot.entry.is_some())?;
+        let handle = Handle::from_raw((u64::from(slot.generation) << 32) | index as u64);
+        self.remove(handle).ok()
     }
 
     fn slot(&self, handle: Handle) -> Result<&Slot<T>, Error> {
@@ -147,6 +161,18 @@ mod tests {
             Err(Error::InvalidHandle)
         );
         assert_eq!(table.resolve(next, Rights::OPEN), Ok(30));
+    }
+
+    #[test]
+    fn removal_returns_resources_once_and_retires_handles() {
+        let mut table = CapabilityTable::<2>::new();
+        let a = table.insert(ObjectId(7), Rights::SEND).unwrap();
+        let b = table.insert(ObjectId(8), Rights::RECEIVE).unwrap();
+        assert_eq!(table.remove(a), Ok(ObjectId(7)));
+        assert_eq!(table.remove(a), Err(Error::InvalidHandle));
+        assert_eq!(table.pop(), Some(ObjectId(8)));
+        assert_eq!(table.pop(), None);
+        assert_eq!(table.resolve(b, Rights::RECEIVE), Err(Error::InvalidHandle));
     }
 
     #[test]

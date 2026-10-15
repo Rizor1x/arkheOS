@@ -158,24 +158,29 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Validate every destination page before writing any bytes. IRQs stay masked,
-    /// and only this kernel owns the tables, so the second walk cannot race unmapping.
-    pub fn copy_to_user(&self, address: u64, source: &[u8]) -> Result<(), MapError> {
-        if source.is_empty() {
+    pub fn validate_write(&self, address: u64, length: usize) -> Result<(), MapError> {
+        if length == 0 {
             return Ok(());
         }
         let end = address
-            .checked_add(source.len() as u64)
+            .checked_add(length as u64)
             .ok_or(MapError::InvalidAddress)?;
         if address < 0x10000 || end > USER_LIMIT {
             return Err(MapError::InvalidAddress);
         }
         let mut done = 0;
-        while done < source.len() {
+        while done < length {
             let current = address + done as u64;
             self.pointer(self.walk(current, true)?)?;
-            done += (source.len() - done).min((PAGE - current % PAGE) as usize);
+            done += (length - done).min((PAGE - current % PAGE) as usize);
         }
+        Ok(())
+    }
+
+    /// Validate every destination page before writing any bytes. IRQs stay masked,
+    /// and only this kernel owns the tables, so the second walk cannot race unmapping.
+    pub fn copy_to_user(&self, address: u64, source: &[u8]) -> Result<(), MapError> {
+        self.validate_write(address, source.len())?;
         let mut done = 0;
         while done < source.len() {
             let current = address + done as u64;

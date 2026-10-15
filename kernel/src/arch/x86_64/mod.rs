@@ -26,13 +26,3 @@ pub fn exit_test(code: u32) -> ! {
     }
     halt()
 }
-
-pub fn idle() -> ! {
-    loop {
-        // SAFETY: All tasks have exited; the installed timer gate acknowledges IRQs.
-        // STI's interrupt shadow makes HLT atomic with respect to pending interrupts.
-        unsafe {
-            core::arch::asm!("sti", "hlt", options(nomem, nostack));
-        }
-    }
-}

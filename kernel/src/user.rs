@@ -1,9 +1,12 @@
+mod ipc;
+
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use arkhe_abi::{ABI_VERSION, Error, Handle, MAX_IO_BYTES, MAX_PATH_BYTES, Syscall};
 use arkhe_kernel_core::capability::{CapabilityTable, Rights};
 use arkhe_kernel_core::elf::Executable;
+use arkhe_kernel_core::endpoint::{EndpointId, Endpoints};
 use arkhe_kernel_core::filesystem::{OpenFile, ReadOnlyFs};
 use arkhe_kernel_core::frame_pool::FramePool;
 use arkhe_kernel_core::initramfs::Archive;
@@ -21,15 +24,30 @@ enum Resource {
     Console,
     Directory,
     File(OpenFile<'static>),
+    Sender(EndpointId),
+    Receiver(EndpointId),
 }
 const PROCESSES: usize = 3;
 const ROUNDS: u64 = 2;
+
+#[derive(Clone, Copy)]
+enum Wait {
+    Receive {
+        endpoint: EndpointId,
+        pointer: u64,
+        capacity: usize,
+    },
+    Sleep {
+        deadline: u64,
+    },
+}
 
 struct Process {
     space: AddressSpace,
     capabilities: CapabilityTable<8, Resource>,
     context: ExceptionFrame,
     ticks: u64,
+    wait: Option<Wait>,
 }
 impl Process {
     const fn new() -> Self {
@@ -38,6 +56,7 @@ impl Process {
             capabilities: CapabilityTable::new(),
             context: ExceptionFrame::EMPTY,
             ticks: 0,
+            wait: None,
         }
     }
 }
@@ -45,6 +64,10 @@ struct State {
     processes: [Process; PROCESSES],
     frames: FramePool<POOL_FRAMES>,
     scheduler: Scheduler<PROCESSES>,
+    endpoints: Endpoints<PROCESSES, 4>,
+    blocks: u64,
+    wakes: u64,
+    idle_entries: u64,
     image: Option<Executable<'static>>,
     filesystem: Option<ReadOnlyFs<'static>>,
     kernel_root: u64,
@@ -64,6 +87,10 @@ static STATE: ProcessStorage = ProcessStorage(UnsafeCell::new(State {
     processes: [const { Process::new() }; PROCESSES],
     frames: FramePool::new(),
     scheduler: Scheduler::new(),
+    endpoints: Endpoints::new(),
+    blocks: 0,
+    wakes: 0,
+    idle_entries: 0,
     image: None,
     filesystem: None,
     kernel_root: 0,
@@ -109,26 +136,30 @@ pub fn launch(
         !INITIALIZED.swap(true, Ordering::AcqRel),
         "process state already initialized"
     );
-    let state = state();
-    state.frames.initialize(ranges).expect("usable frame pool");
-    state.kernel_root = paging::active_root();
-    state.direct_map = direct_map;
-    state.image = Some(elf);
-    state.filesystem = Some(ReadOnlyFs::new(archive));
-    #[cfg(feature = "smoke")]
-    check_load_rollback(state, ranges);
-    spawn_round(state);
-    #[cfg(feature = "smoke")]
-    state.processes[0].space.check_copy_permissions();
-    let slot = state.scheduler.advance().expect("first runnable process");
-    cpu::timer::init();
-    cpu::write_console(format_args!(
-        "scheduler: three isolated Rust processes, timer ~100 Hz\n"
-    ));
-    let process = &state.processes[slot];
+    let (root, context) = {
+        let state = state();
+        state.frames.initialize(ranges).expect("usable frame pool");
+        state.kernel_root = paging::active_root();
+        state.direct_map = direct_map;
+        state.image = Some(elf);
+        state.filesystem = Some(ReadOnlyFs::new(archive));
+        #[cfg(feature = "smoke")]
+        check_load_rollback(state, ranges);
+        spawn_round(state);
+        #[cfg(feature = "smoke")]
+        state.processes[0].space.check_copy_permissions();
+        let slot = state.scheduler.advance().expect("first runnable process");
+        cpu::timer::init();
+        cpu::write_console(format_args!(
+            "scheduler: three isolated Rust processes, timer ~100 Hz\n"
+        ));
+        let process = &state.processes[slot];
+
+        (process.space.root(), core::ptr::addr_of!(process.context))
+    };
     // SAFETY: The static frame has validated RX entry, RW/NX stack, ring-3 selectors,
-    // IF=1/IOPL=0 and zeroed GPRs. All IRQ gates are installed before enabling IF.
-    unsafe { arkhe_enter_user(process.space.root(), &process.context) }
+    // IF=1/IOPL=0 and zeroed GPRs. No state borrow survives this assembly handoff.
+    unsafe { arkhe_enter_user(root, context) }
 }
 
 #[cfg(feature = "smoke")]
@@ -153,6 +184,9 @@ fn check_load_rollback(state: &mut State, ranges: &[FrameRange]) {
 
 fn spawn_round(state: &mut State) {
     assert_eq!(state.frames.live_count(), 0, "previous round leaked frames");
+    assert_eq!(state.endpoints.live_count(), 0, "endpoint leak");
+    let endpoints: [EndpointId; PROCESSES] =
+        core::array::from_fn(|_| state.endpoints.create().expect("endpoint quota"));
     for (role, process) in state.processes.iter_mut().enumerate() {
         // SAFETY: The pool exclusively owns usable RAM. The BSP has not started APs;
         // supervisor mappings remain shared, and this process is not yet runnable.
@@ -173,12 +207,26 @@ fn spawn_round(state: &mut State) {
             .capabilities
             .insert(Resource::Directory, Rights::OPEN)
             .expect("root capability");
+        let sender = process
+            .capabilities
+            .insert(
+                Resource::Sender(endpoints[(role + 1) % PROCESSES]),
+                Rights::SEND,
+            )
+            .expect("send capability");
+        let receiver = process
+            .capabilities
+            .insert(Resource::Receiver(endpoints[role]), Rights::RECEIVE)
+            .expect("receive capability");
+        process.wait = None;
         process.context = ExceptionFrame::user(
             state.image.as_ref().expect("init image").entry(),
             STACK_TOP - 8,
             console.raw(),
             role as u64,
             root.raw(),
+            sender.raw(),
+            receiver.raw(),
         );
         process.ticks = 0;
         state.scheduler.insert(role).expect("vacant process slot");
@@ -203,12 +251,46 @@ pub fn syscall(frame: &mut ExceptionFrame) {
             state.scheduler.advance();
             restore(state, frame);
         }
+        Ok(Syscall::Send) => {
+            let result = ipc::send(state, slot, a, b, c);
+            frame.result(status(result));
+        }
+        Ok(Syscall::Receive) => {
+            ipc::receive(state, frame, slot, a, b, c);
+        }
+        Ok(Syscall::Close) => {
+            let result = state.processes[slot]
+                .capabilities
+                .remove(Handle::from_raw(a))
+                .map(|resource| {
+                    if ipc::release(state, resource) {
+                        ipc::wake_receivers(state);
+                    }
+                    0
+                });
+            frame.result(status(result));
+        }
+        Ok(Syscall::SleepTicks) => {
+            if a == 0 {
+                frame.result(0);
+            } else if a > 1000 || cpu::timer::ticks().checked_add(a).is_none() {
+                frame.result(Error::InvalidArgument as i64);
+            } else {
+                frame.result(0);
+                block(
+                    state,
+                    frame,
+                    Wait::Sleep {
+                        deadline: cpu::timer::ticks() + a,
+                    },
+                );
+            }
+        }
         call => {
             let process = &mut state.processes[slot];
             let result = match call {
                 Ok(Syscall::Version) => Ok(u64::from(ABI_VERSION)),
                 Ok(Syscall::ClockTicks) => Ok(cpu::timer::ticks().min(i64::MAX as u64)),
-                Ok(Syscall::Close) => process.capabilities.close(Handle::from_raw(a)).map(|()| 0),
                 Ok(Syscall::DebugWrite) => write(process, a, b, c),
                 Ok(Syscall::FileOpen) => open(
                     process,
@@ -228,38 +310,87 @@ pub fn syscall(frame: &mut ExceptionFrame) {
     }
 }
 
-pub fn preempt(frame: &mut ExceptionFrame) {
-    let state = state();
-    let slot = state.scheduler.current().expect("running timer process");
-    state.processes[slot].ticks = state.processes[slot].ticks.saturating_add(1);
-    state.preemptions = state.preemptions.saturating_add(1);
-    #[cfg(feature = "smoke")]
-    if env!("ARKHE_TEST_CASE") == "scheduler" && slot == 0 && state.processes[slot].ticks == 8 {
-        cpu::write_console(format_args!(
-            "scheduler: stopped non-cooperative test process\n"
-        ));
-        retire(state, frame);
-        return;
+fn status(result: Result<u64, Error>) -> i64 {
+    match result {
+        Ok(value) => value as i64,
+        Err(error) => error as i64,
     }
-    state.processes[slot].context = *frame;
-    state.scheduler.advance();
+}
+
+pub fn on_timer(frame: &mut ExceptionFrame) {
+    let state = state();
+    for slot in 0..PROCESSES {
+        if matches!(state.processes[slot].wait, Some(Wait::Sleep { deadline }) if cpu::timer::ticks() >= deadline)
+        {
+            wake(state, slot, 0);
+        }
+    }
+    if frame.is_user() {
+        let slot = state.scheduler.current().expect("running timer process");
+        state.processes[slot].ticks = state.processes[slot].ticks.saturating_add(1);
+        state.preemptions = state.preemptions.saturating_add(1);
+        #[cfg(feature = "smoke")]
+        if env!("ARKHE_TEST_CASE") == "scheduler" && slot == 0 && state.processes[slot].ticks == 8 {
+            cpu::write_console(format_args!(
+                "scheduler: stopped non-cooperative test process\n"
+            ));
+            retire(state, frame);
+            return;
+        }
+        state.processes[slot].context = *frame;
+        state.scheduler.advance();
+    } else if state.scheduler.current().is_none() {
+        state.scheduler.advance();
+    }
     restore(state, frame);
 }
 
-fn restore(state: &State, frame: &mut ExceptionFrame) {
-    let slot = state.scheduler.current().expect("selected process");
-    let process = &state.processes[slot];
-    *frame = process.context;
-    // SAFETY: All process roots retain the same supervisor kernel/IST mappings.
-    // No Rust reference points into the outgoing user mappings; IRQs remain masked.
-    unsafe {
-        paging::switch(process.space.root());
+fn block(state: &mut State, frame: &mut ExceptionFrame, wait: Wait) {
+    let slot = state.scheduler.current().expect("blocking process");
+    state.processes[slot].context = *frame;
+    state.processes[slot].wait = Some(wait);
+    state.blocks = state.blocks.saturating_add(1);
+    state.scheduler.block_current();
+    restore(state, frame);
+}
+
+fn wake(state: &mut State, slot: usize, result: i64) {
+    state.processes[slot].context.result(result);
+    state.processes[slot].wait = None;
+    state.scheduler.wake(slot).expect("blocked wake target");
+    state.wakes = state.wakes.saturating_add(1);
+}
+
+fn restore(state: &mut State, frame: &mut ExceptionFrame) {
+    let root = if let Some(slot) = state.scheduler.current() {
+        let process = &state.processes[slot];
+        *frame = process.context;
+        process.space.root()
+    } else {
+        *frame = ExceptionFrame::idle();
+        state.idle_entries = state.idle_entries.saturating_add(1);
+        state.kernel_root
+    };
+    if paging::active_root() != root {
+        // SAFETY: All roots retain supervisor/IST mappings. Rust borrows end on
+        // handler return before IRET enables IRQs on the selected user/idle stack.
+        unsafe {
+            paging::switch(root);
+        }
     }
 }
 
 fn retire(state: &mut State, frame: &mut ExceptionFrame) {
     let slot = state.scheduler.remove_current().expect("live process");
     state.completed += 1;
+    state.processes[slot].wait = None;
+    while let Some(resource) = state.processes[slot].capabilities.pop() {
+        ipc::release(state, resource);
+    }
+    ipc::wake_receivers(state);
+    if state.scheduler.current().is_none() {
+        state.scheduler.advance();
+    }
     let root = state
         .scheduler
         .current()
@@ -271,7 +402,8 @@ fn retire(state: &mut State, frame: &mut ExceptionFrame) {
     }
     state.processes[slot].space.release(&mut state.frames);
     state.processes[slot].capabilities = CapabilityTable::new();
-    if state.scheduler.current().is_none() {
+    if state.scheduler.live_count() == 0 {
+        assert_eq!(state.endpoints.live_count(), 0, "endpoint leak");
         assert_eq!(state.frames.live_count(), 0, "process frame leak");
         cpu::write_console(format_args!(
             "memory: round {} reclaimed all process frames\n",
@@ -359,29 +491,37 @@ fn read(process: &mut Process, handle: u64, pointer: u64, length: u64) -> Result
     .map(|count| count as u64)
 }
 
-fn finish(state: &State) -> ! {
+fn finish(state: &State) {
     assert_eq!(state.completed, PROCESSES * ROUNDS as usize);
     cpu::write_console(format_args!(
-        "scheduler: all processes stopped; preemptions={}, yields={}\n",
-        state.preemptions, state.yields
+        "scheduler: all processes stopped; preemptions={}, yields={}, blocks={}, wakes={}, idle={}\n",
+        state.preemptions, state.yields, state.blocks, state.wakes, state.idle_entries
     ));
     #[cfg(feature = "smoke")]
     {
         let case = env!("ARKHE_TEST_CASE");
-        let expected = if matches!(case, "boot" | "scheduler" | "idle") {
+        let expected = if matches!(case, "boot" | "scheduler" | "idle" | "ipc") {
             0
         } else {
             ROUNDS as usize
         };
-        if state.failed || state.expected_faults != expected || state.yields == 0 {
+        if state.failed
+            || state.expected_faults != expected
+            || state.yields == 0
+            || state.blocks == 0
+            || state.blocks != state.wakes
+            || state.idle_entries == 0
+        {
             cpu::exit_test(0x11);
         }
         if case == "idle" {
             cpu::timer::begin_idle_test();
-            cpu::idle();
+            return;
         }
         let marker = match case {
             "boot" => "ARKHE_USER_OK",
+            "ipc" => "ARKHE_IPC_OK",
+            "ipc-peer-fault" => "ARKHE_IPC_PEER_FAULT_OK",
             "scheduler" if state.preemptions >= 16 => "ARKHE_SCHEDULER_OK",
             "user-kernel-read" => "ARKHE_USER_KERNEL_READ_OK",
             "user-cli" => "ARKHE_USER_CLI_OK",
@@ -395,8 +535,6 @@ fn finish(state: &State) -> ! {
         cpu::write_console(format_args!("{marker}\n"));
         cpu::exit_test(0x10);
     }
-    #[cfg(not(feature = "smoke"))]
-    cpu::idle();
 }
 
 pub fn fault(frame: &mut ExceptionFrame, vector: u64, error: u64, address: u64) {
@@ -405,15 +543,17 @@ pub fn fault(frame: &mut ExceptionFrame, vector: u64, error: u64, address: u64) 
     cpu::write_console(format_args!(
         "process {slot}: exception {vector}, error {error:#x}, address {address:#x}\n"
     ));
-    let expected = slot == 0
-        && matches!(
-            (env!("ARKHE_TEST_CASE"), vector, error),
-            ("user-kernel-read", 14, 5)
-                | ("user-cli", 13, 0)
-                | ("user-write-code", 14, 7)
-                | ("user-exec-stack", 14, 0x15)
-                | ("user-fpu", 7, 0)
-        );
+    let expected =
+        (slot == 2 && env!("ARKHE_TEST_CASE") == "ipc-peer-fault" && vector == 6 && error == 0)
+            || slot == 0
+                && matches!(
+                    (env!("ARKHE_TEST_CASE"), vector, error),
+                    ("user-kernel-read", 14, 5)
+                        | ("user-cli", 13, 0)
+                        | ("user-write-code", 14, 7)
+                        | ("user-exec-stack", 14, 0x15)
+                        | ("user-fpu", 7, 0)
+                );
     if expected {
         state.expected_faults += 1;
     } else {

@@ -1,5 +1,10 @@
 .section .text
 
+.global arkhe_idle
+arkhe_idle:
+    hlt
+    jmp arkhe_idle
+
 .macro EXCEPTION vector, error=0
 .global arkhe_exception_\vector
 arkhe_exception_\vector:

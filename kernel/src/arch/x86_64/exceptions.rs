@@ -84,7 +84,7 @@ struct Descriptors {
     gdt: [u64; 7],
     task: TaskState,
     idt: [Gate; 256],
-    stacks: [[u8; STACK_BYTES]; 6],
+    stacks: [[u8; STACK_BYTES]; 7],
 }
 
 struct DescriptorStorage(UnsafeCell<Descriptors>);
@@ -97,7 +97,7 @@ static STORAGE: DescriptorStorage = DescriptorStorage(UnsafeCell::new(Descriptor
     gdt: [0; 7],
     task: TaskState::EMPTY,
     idt: [Gate::EMPTY; 256],
-    stacks: [[0; STACK_BYTES]; 6],
+    stacks: [[0; STACK_BYTES]; 7],
 }));
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -105,6 +105,7 @@ unsafe extern "C" {
     static arkhe_exception_entries: [usize; 32];
     fn arkhe_unexpected_entry();
     fn arkhe_exception_128();
+    fn arkhe_idle();
     fn arkhe_exception_32();
     fn arkhe_exception_39();
     fn arkhe_exception_47();
@@ -216,7 +217,15 @@ impl ExceptionFrame {
         stack_segment: 27,
     };
 
-    pub fn user(entry: u64, stack: u64, console: u64, role: u64, root: u64) -> Self {
+    pub fn user(
+        entry: u64,
+        stack: u64,
+        console: u64,
+        role: u64,
+        root: u64,
+        sender: u64,
+        receiver: u64,
+    ) -> Self {
         let mut frame = Self {
             instruction: entry,
             stack_pointer: stack,
@@ -225,7 +234,22 @@ impl ExceptionFrame {
         frame.registers[8] = console;
         frame.registers[9] = role;
         frame.registers[12] = root;
+        frame.registers[13] = sender;
+        frame.registers[7] = receiver;
         frame
+    }
+
+    pub fn idle() -> Self {
+        // SAFETY: Only an address is formed; the seventh static stack is reserved
+        // for the assembly idle loop and is never used as an interrupt IST.
+        let stack = unsafe { core::ptr::addr_of!((*STORAGE.0.get()).stacks[6]) as u64 };
+        Self {
+            instruction: arkhe_idle as *const () as u64,
+            code_segment: 8,
+            stack_pointer: stack + STACK_BYTES as u64,
+            stack_segment: 16,
+            ..Self::EMPTY
+        }
     }
 
     pub fn arguments(&self) -> [u64; 4] {
@@ -249,9 +273,7 @@ impl ExceptionFrame {
 extern "C" fn arkhe_exception_dispatch(frame: &mut ExceptionFrame) {
     if frame.vector == 32 {
         super::timer::tick();
-        if frame.is_user() {
-            crate::user::preempt(frame);
-        }
+        crate::user::on_timer(frame);
         return;
     }
     if matches!(frame.vector, 39 | 47) {
@@ -359,8 +381,8 @@ pub fn trigger_test_fault() {
                 core::arch::asm!("mov rax, [{address}]", address = in(reg) TEST_FAULT_ADDRESS, out("rax") _);
             }
         }
-        "idle" | "scheduler" | "user-fpu" | "boot" | "user-kernel-read" | "user-cli"
-        | "user-write-code" | "user-exec-stack" => return,
+        "ipc" | "ipc-peer-fault" | "idle" | "scheduler" | "user-fpu" | "boot"
+        | "user-kernel-read" | "user-cli" | "user-write-code" | "user-exec-stack" => return,
         _ => panic!("unknown fault test"),
     }
     panic!("expected CPU exception was not raised");

@@ -26,7 +26,7 @@ fn dispatch() -> Result {
     match task {
         "help" if args.len() <= 1 => {
             println!(
-                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|smoke-userspace|smoke-scheduler|audit|hooks|doctor>"
+                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|smoke-userspace|smoke-scheduler|smoke-ipc|audit|hooks|doctor>"
             );
             Ok(())
         }
@@ -37,6 +37,10 @@ fn dispatch() -> Result {
         "iso" => iso(false, "boot").map(|_| ()),
         "run" => run_qemu(),
         "smoke" => smoke("boot", "ARKHE_USER_OK"),
+        "smoke-ipc" => {
+            smoke("ipc", "ARKHE_IPC_OK")?;
+            smoke("ipc-peer-fault", "ARKHE_IPC_PEER_FAULT_OK")
+        }
         "smoke-scheduler" => {
             smoke("scheduler", "ARKHE_SCHEDULER_OK")?;
             smoke("idle", "ARKHE_IDLE_OK")
