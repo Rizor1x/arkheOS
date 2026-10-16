@@ -183,12 +183,23 @@ pub fn launch(
         ));
         #[cfg(feature = "smoke")]
         {
+            state.processes[0].space.check_load_lifecycle(
+                &mut state.frames,
+                &mut state.kernel_space,
+                state.image.as_ref().expect("init image"),
+            );
+            cpu::write_console(format_args!(
+                "memory: executable sealing rollback and reuse verified\n"
+            ));
             paging::kernel::trigger_fault(memory);
             cpu::exceptions::trigger_test_fault();
         }
         spawn_round(state);
         #[cfg(feature = "smoke")]
-        state.processes[0].space.check_copy_permissions();
+        {
+            state.processes[0].space.check_copy_permissions();
+            check_code_alias(state);
+        }
         let slot = state.scheduler.advance().expect("first runnable process");
         cpu::timer::init();
         cpu::write_console(format_args!(
@@ -204,21 +215,35 @@ pub fn launch(
 }
 
 #[cfg(feature = "smoke")]
+fn check_code_alias(state: &mut State) {
+    let case = env!("ARKHE_TEST_CASE");
+    if !matches!(case, "user-code-alias" | "user-code-alias-switched") {
+        return;
+    }
+    let alias = state.processes[0].space.executable_alias();
+    if case == "user-code-alias-switched" {
+        // SAFETY: This second inactive process shares the retained kernel upper half.
+        // Switching flushes old translations before probing the first process's alias.
+        unsafe { paging::switch(state.processes[1].space.root()) };
+    }
+    paging::kernel::trigger_alias_fault(alias);
+}
+
+#[cfg(feature = "smoke")]
 fn check_load_rollback(state: &mut State, ranges: &[FrameRange]) {
     // The main pool has issued no frames; this temporary pool exclusively owns RAM
     // during the failed load and returns every lease before the main pool is used.
     assert_eq!(state.frames.live_count(), 0);
     let mut small = FramePool::<4>::new();
     small.initialize(ranges).expect("rollback test pool");
-    // SAFETY: Exclusive temporary frame ownership, IRQs off, shared supervisor mappings.
-    let result = unsafe {
-        state.processes[0].space.load(
+    // SAFETY: This temporary pool alone owns RAM before any main-pool allocation.
+    unsafe {
+        state.processes[0].space.check_unsealed_rollback(
             &mut small,
             state.direct_map,
             state.image.as_ref().expect("init image"),
-        )
-    };
-    assert_eq!(result, Err(paging::MapError::NoMemory));
+        );
+    }
     assert_eq!(small.live_count(), 0, "failed ELF load leaked frames");
     cpu::write_console(format_args!("memory: partial ELF load rolled back\n"));
 }
@@ -244,7 +269,7 @@ fn spawn_round(state: &mut State) {
         unsafe {
             process.space.load(
                 &mut state.frames,
-                state.direct_map,
+                &mut state.kernel_space,
                 state.image.as_ref().expect("init image"),
             )
         }
@@ -481,7 +506,9 @@ fn retire(state: &mut State, frame: &mut ExceptionFrame, outcome: u64) {
     unsafe {
         paging::switch(root);
     }
-    state.processes[slot].space.release(&mut state.frames);
+    state.processes[slot]
+        .space
+        .release(&mut state.frames, &mut state.kernel_space);
     state.processes[slot].capabilities = CapabilityTable::new();
     if state.scheduler.live_count() == 0 {
         assert_eq!(state.endpoints.live_count(), 0, "endpoint leak");

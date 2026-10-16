@@ -12,6 +12,8 @@ fn main() {
             | "kernel-exec-data"
             | "kernel-stack-guard"
             | "kernel-write-module"
+            | "user-code-alias"
+            | "user-code-alias-switched"
             | "boot"
             | "spawn"
             | "ipc"

@@ -21,6 +21,7 @@ Implemented:
 - channel creation through explicit authority, with transactional descriptor allocation;
 - legacy PC PIC/PIT timer at approximately 100 Hz;
 - RX user code, RW/NX data and stack, and unmapped stack guard pages;
+- executable-page sealing with read-only direct-map aliases and ordered reclamation;
 - bounded USTAR initramfs with checked headers and indexed file lookup;
 - static ELF64 loading with segment, entry, bounds, and W^X validation;
 - version, console-write, close, yield, timer-tick, file-open/read, and exit calls
@@ -65,6 +66,8 @@ cargo xtask run
 
 The QEMU machine uses TCG, one CPU, 256 MiB RAM, and no network interface.
 Output appears in the serial console. Stop QEMU with Ctrl+C.
+On Apple Silicon, these commands emulate x86_64; the kernel does not yet support
+ARM64 or boot directly on Apple Silicon hardware.
 
 ## Tests
 
@@ -95,6 +98,10 @@ uses the absent direct-map address of that code, executes RW/NX data, reads the
 bootstrap stack guard, or writes the read-only initramfs. Each fault must match
 the expected vector, address, and access flags. Every smoke boot also exhausts
 a four-frame kernel-table pool and requires complete construction rollback.
+Two more cases attempt to write user code through its supervisor direct-map
+alias, before and after switching to another process root. Every smoke boot
+requires a partial-sealing rollback, writable reuse and full-page zeroing of a
+released code frame, and two successful load/seal/release cycles.
 
 `smoke-userspace` verifies that user code cannot read mapped kernel memory,
 execute privileged instructions, write its RX code, execute its NX stack, or use
@@ -144,6 +151,15 @@ provides `edk2-x86_64-code.fd` and `edk2-i386-vars.fd` under its `share/qemu`
 directory. Each UEFI run uses a fresh variables-template copy. Secure Boot is
 not implemented.
 
+For Homebrew QEMU on macOS:
+
+```sh
+export ARKHE_OVMF="$(brew --prefix qemu)/share/qemu/edk2-x86_64-code.fd"
+export ARKHE_OVMF_VARS="$(brew --prefix qemu)/share/qemu/edk2-i386-vars.fd"
+cargo xtask smoke
+cargo xtask smoke-mappings
+```
+
 ## Layout
 
 | Path | Purpose |
@@ -183,10 +199,14 @@ Kernel page-table frames stay owned for the kernel lifetime and share the
 4,096-frame pool with processes. At 256 MiB QEMU RAM, the kernel retains 134 table
 frames. Each process round must release all remaining frames. Kernel table
 storage is bounded to 1,100 frames; larger memory layouts can fail construction.
-User RX pages still have writable supervisor direct-map aliases used by the
-loader. Their load/finalize/release protection is the next memory step; complete
-system-wide W^X, runtime mapping APIs, SMP, and per-CPU TLB synchronization are
-not implemented.
+User image pages remain non-executable during loading. Before enabling execution,
+the loader makes each code frame's shared supervisor alias RO/NX and invalidates
+its cached translation. Code is therefore RX only after writable aliases are gone.
+On exit or rollback, the kernel first switches away, revokes inactive execution,
+restores and invalidates the RW/NX alias, then releases the frame. Reused pages
+are zeroed before publication. PCID and global translations are disabled for this
+single-CPU contract. Runtime mapping APIs, SMP, and per-CPU TLB synchronization
+are not implemented.
 
 ## Filesystem
 

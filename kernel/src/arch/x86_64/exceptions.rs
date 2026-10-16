@@ -386,8 +386,19 @@ pub fn trigger_test_fault() {
                 core::arch::asm!("mov rax, [{address}]", address = in(reg) TEST_FAULT_ADDRESS, out("rax") _);
             }
         }
-        "ipc" | "ipc-peer-fault" | "idle" | "scheduler" | "user-fpu" | "boot" | "spawn"
-        | "user-kernel-read" | "user-cli" | "user-write-code" | "user-exec-stack" => return,
+        "ipc"
+        | "ipc-peer-fault"
+        | "idle"
+        | "scheduler"
+        | "user-fpu"
+        | "boot"
+        | "spawn"
+        | "user-kernel-read"
+        | "user-cli"
+        | "user-write-code"
+        | "user-exec-stack"
+        | "user-code-alias"
+        | "user-code-alias-switched" => return,
         _ => panic!("unknown fault test"),
     }
     panic!("expected CPU exception was not raised");

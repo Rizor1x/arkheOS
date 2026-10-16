@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 const TARGET: &str = "x86_64-unknown-none";
+const MEMORY_CHECK_MARKER: &str = "memory: executable sealing rollback and reuse verified";
 
 fn main() {
     if let Err(error) = dispatch() {
@@ -44,6 +45,8 @@ fn dispatch() -> Result {
                 "kernel-exec-data",
                 "kernel-stack-guard",
                 "kernel-write-module",
+                "user-code-alias",
+                "user-code-alias-switched",
             ] {
                 smoke(case, "ARKHE_KERNEL_MAPPING_OK")?;
             }
@@ -463,7 +466,10 @@ fn smoke_output_valid(case: &str, marker: &str, text: &str) -> bool {
             .filter(|line| line.trim() == "service: orphan observed parent closure")
             .count()
             == 2;
-    orphan_verified && text.lines().any(|line| line.trim() == marker) && !text.contains("PANIC:")
+    orphan_verified
+        && text.lines().any(|line| line.trim() == MEMORY_CHECK_MARKER)
+        && text.lines().any(|line| line.trim() == marker)
+        && !text.contains("PANIC:")
 }
 
 fn ensure_git_root() -> Result {
@@ -497,19 +503,24 @@ fn doctor() -> Result {
 
 #[cfg(test)]
 mod tests {
-    use super::smoke_output_valid;
+    use super::{MEMORY_CHECK_MARKER, smoke_output_valid};
 
     #[test]
     fn process_smoke_requires_both_unwatched_child_confirmations() {
         let marker = "ARKHE_PROCESS_OK";
         let one = "service: orphan observed parent closure\r\n";
-        assert!(!smoke_output_valid("spawn", marker, marker));
+        let memory = format!("{MEMORY_CHECK_MARKER}\r\n");
         assert!(!smoke_output_valid(
             "spawn",
             marker,
-            &format!("{one}{marker}")
+            &format!("{memory}{marker}")
         ));
-        let complete = format!("{one}{one}{marker}");
+        assert!(!smoke_output_valid(
+            "spawn",
+            marker,
+            &format!("{memory}{one}{marker}")
+        ));
+        let complete = format!("{memory}{one}{one}{marker}");
         assert!(smoke_output_valid("spawn", marker, &complete));
         assert!(smoke_output_valid("boot", marker, &complete));
         assert!(!smoke_output_valid(
@@ -517,7 +528,34 @@ mod tests {
             marker,
             &format!("{complete}\nPANIC:")
         ));
-        assert!(!smoke_output_valid("spawn", marker, &format!("{one}{one}")));
-        assert!(smoke_output_valid("ipc", marker, marker));
+        assert!(!smoke_output_valid(
+            "spawn",
+            marker,
+            &format!("{memory}{one}{one}")
+        ));
+        assert!(smoke_output_valid(
+            "ipc",
+            marker,
+            &format!("{memory}{marker}")
+        ));
+    }
+
+    #[test]
+    fn smoke_requires_completed_memory_checks() {
+        let marker = "ARKHE_KERNEL_MAPPING_OK";
+        for case in ["kernel-write-code", "user-code-alias", "ipc", "divide"] {
+            assert!(!smoke_output_valid(case, marker, marker));
+            assert!(!smoke_output_valid(
+                case,
+                marker,
+                &format!("prefix {MEMORY_CHECK_MARKER}\n{marker}")
+            ));
+            assert!(!smoke_output_valid(case, marker, MEMORY_CHECK_MARKER));
+            assert!(smoke_output_valid(
+                case,
+                marker,
+                &format!("{MEMORY_CHECK_MARKER}\r\n{marker}\r\n")
+            ));
+        }
     }
 }

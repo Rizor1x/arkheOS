@@ -13,7 +13,7 @@ pub(super) fn launch_supervisor(state: &mut State) {
     unsafe {
         process
             .space
-            .load(&mut state.frames, state.direct_map, image)
+            .load(&mut state.frames, &mut state.kernel_space, image)
     }
     .expect("supervisor address space");
     let console = process
@@ -149,7 +149,7 @@ fn create(
     let loaded = unsafe {
         child
             .space
-            .load(&mut state.frames, state.direct_map, &image)
+            .load(&mut state.frames, &mut state.kernel_space, &image)
     };
     if let Err(error) = loaded {
         state.processes[parent]

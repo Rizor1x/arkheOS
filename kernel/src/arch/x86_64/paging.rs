@@ -1,4 +1,6 @@
 pub mod kernel;
+#[cfg(feature = "smoke")]
+mod probes;
 
 use arkhe_kernel_core::elf::Executable;
 use arkhe_kernel_core::frame_pool::{Frame, FramePool};
@@ -29,8 +31,14 @@ pub enum MapError {
 pub struct AddressSpace {
     root: u64,
     direct_map: u64,
-    owned: [Option<Frame>; MAX_OWNED_FRAMES],
+    owned: [Option<OwnedFrame>; MAX_OWNED_FRAMES],
     count: usize,
+}
+
+struct OwnedFrame {
+    frame: Frame,
+    executable_at: u64,
+    sealed: bool,
 }
 
 impl AddressSpace {
@@ -44,21 +52,21 @@ impl AddressSpace {
     }
 
     /// # Safety
-    /// The allocator must exclusively own usable RAM mapped at `direct_map` by the
-    /// retained supervisor root (Limine during the pre-switch rollback probe).
-    /// No other CPU may change the inherited kernel mappings while this space is alive.
+    /// The IRQ-masked BSP exclusively owns the pool. The active root shares the
+    /// retained `kernel` upper half, with PCID and global translations disabled.
+    /// This space is inactive and cannot run until loading and sealing succeed.
     pub unsafe fn load<const N: usize>(
         &mut self,
         frames: &mut FramePool<N>,
-        direct_map: u64,
+        kernel: &mut AddressSpace,
         elf: &Executable<'_>,
     ) -> Result<(), MapError> {
         assert_eq!(self.count, 0, "address space already owns frames");
-        self.direct_map = direct_map;
+        self.direct_map = kernel.direct_map;
         // SAFETY: The caller provides exclusive usable RAM and unchanged kernel mappings.
-        let result = unsafe { self.load_inner(frames, elf) };
+        let result = unsafe { self.load_inner(frames, elf) }.and_then(|()| self.finalize(kernel));
         if result.is_err() {
-            self.release(frames);
+            self.release(frames, kernel);
         }
         result
     }
@@ -75,7 +83,7 @@ impl AddressSpace {
             core::arch::asm!("mov {}, cr3", out(reg) old_root, options(nomem, nostack));
             core::arch::asm!("mov {}, cr4", out(reg) control, options(nomem, nostack));
         }
-        if control & (1 << 12) != 0 || self.direct_map & (PAGE - 1) != 0 {
+        if control & ((1 << 12) | (1 << 17)) != 0 || self.direct_map & (PAGE - 1) != 0 {
             return Err(MapError::InvalidAddress);
         }
         enable_protection();
@@ -101,16 +109,46 @@ impl AddressSpace {
     }
 
     /// Switch CR3 away from this root before returning any of its frames.
-    pub fn release<const N: usize>(&mut self, frames: &mut FramePool<N>) {
+    pub fn release<const N: usize>(
+        &mut self,
+        frames: &mut FramePool<N>,
+        kernel: &mut AddressSpace,
+    ) {
+        assert_ne!(
+            active_root(),
+            self.root,
+            "cannot release the active address space"
+        );
+        // With PCID/PGE disabled, switching away discarded user translations.
+        // Revoke inactive RX leaves before restoring writes or returning any lease.
+        for slot in 0..self.count {
+            let owned = self.owned[slot].as_ref().expect("owned frame");
+            if !owned.sealed {
+                continue;
+            }
+            let (table, index, entry) = self
+                .executable_leaf(owned)
+                .expect("sealed executable mapping");
+            self.write_entry(table, index, entry | NX)
+                .expect("revoke inactive execution");
+            kernel
+                .set_alias_write(&owned.frame, true)
+                .expect("restore released direct map");
+            self.owned[slot].as_mut().expect("owned frame").sealed = false;
+        }
+        self.release_frames(frames);
+    }
+
+    fn release_frames<const N: usize>(&mut self, frames: &mut FramePool<N>) {
         assert_ne!(
             active_root(),
             self.root,
             "cannot release the active address space"
         );
         for frame in self.owned[..self.count].iter_mut() {
-            frames
-                .release(frame.take().expect("owned frame"))
-                .expect("frame ownership");
+            let owned = frame.take().expect("owned frame");
+            assert!(!owned.sealed, "cannot release a sealed frame");
+            frames.release(owned.frame).expect("frame ownership");
         }
         self.count = 0;
         self.root = 0;
@@ -126,7 +164,11 @@ impl AddressSpace {
             frames.release(frame).expect("rejected frame ownership");
             return Err(MapError::InvalidAddress);
         }
-        self.owned[self.count] = Some(frame);
+        self.owned[self.count] = Some(OwnedFrame {
+            frame,
+            executable_at: 0,
+            sealed: false,
+        });
         self.count += 1;
         Ok(physical)
     }
@@ -269,9 +311,62 @@ impl AddressSpace {
         }
         let frame = self.allocate(frames)?;
         self.zero(frame)?;
-        let flags =
-            PRESENT | USER | if writable { WRITE } else { 0 } | if executable { 0 } else { NX };
+        if executable {
+            self.owned[self.count - 1]
+                .as_mut()
+                .expect("allocated image frame")
+                .executable_at = address;
+        }
+        // No executable translation exists while the loader can still write the frame.
+        let flags = PRESENT | USER | NX | if writable { WRITE } else { 0 };
         self.write_entry(table, index, frame | flags)
+    }
+
+    fn executable_leaf(&self, owned: &OwnedFrame) -> Result<(u64, usize, u64), MapError> {
+        let (table, index, entry) = self.user_leaf(owned.executable_at)?;
+        if entry & ADDRESS != owned.frame.physical() || entry & WRITE != 0 {
+            return Err(MapError::WritableCode);
+        }
+        if (entry & NX == 0) != owned.sealed {
+            return Err(MapError::InvalidAddress);
+        }
+        Ok((table, index, entry))
+    }
+
+    fn finalize(&mut self, kernel: &mut AddressSpace) -> Result<(), MapError> {
+        assert_ne!(active_root(), self.root, "cannot finalize an active root");
+        for slot in 0..self.count {
+            let owned = self.owned[slot].as_ref().expect("owned frame");
+            if owned.executable_at == 0 {
+                continue;
+            }
+            let (table, index, entry) = self.executable_leaf(owned)?;
+            kernel.set_alias_write(&owned.frame, false)?;
+            // Both walks validated this inactive leaf; no mapping can change on this BSP.
+            self.write_entry(table, index, entry & !NX)
+                .expect("validated executable leaf");
+            self.owned[slot].as_mut().expect("owned frame").sealed = true;
+        }
+        Ok(())
+    }
+
+    fn user_leaf(&self, address: u64) -> Result<(u64, usize, u64), MapError> {
+        if !(0x10000..USER_LIMIT).contains(&address) || !address.is_multiple_of(PAGE) {
+            return Err(MapError::InvalidAddress);
+        }
+        let mut table = self.root;
+        for shift in [39, 30, 21, 12] {
+            let index = ((address >> shift) & 511) as usize;
+            let entry = self.read_entry(table, index)?;
+            if entry & (PRESENT | USER) != PRESENT | USER || (shift != 12 && entry & HUGE != 0) {
+                return Err(MapError::InvalidAddress);
+            }
+            if shift == 12 {
+                return Ok((table, index, entry));
+            }
+            table = entry & ADDRESS;
+        }
+        Err(MapError::InvalidAddress)
     }
 
     fn translate(&self, address: u64) -> Result<u64, MapError> {
@@ -343,7 +438,8 @@ impl AddressSpace {
 
     fn write_entry(&self, table: u64, index: usize, value: u64) -> Result<(), MapError> {
         let address = self.pointer(table)? as *mut u64;
-        // SAFETY: Only newly owned page-table frames are written, before user execution.
+        // SAFETY: The IRQ-masked BSP exclusively owns this table. Inactive user leaves
+        // need no flush; shared supervisor leaf changes invalidate their active alias.
         unsafe {
             address.add(index).write_volatile(value);
         }
@@ -383,6 +479,7 @@ pub fn active_root() -> u64 {
 
 /// # Safety
 /// The root must retain the running kernel, its stack, and all global kernel state.
+/// PCID and global translations must remain disabled for switch-away reclamation.
 pub unsafe fn switch(root: u64) {
     // SAFETY: The caller guarantees shared supervisor mappings; IRQs remain masked.
     unsafe {

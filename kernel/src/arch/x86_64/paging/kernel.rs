@@ -30,7 +30,7 @@ impl AddressSpace {
         super::enable_protection();
         let result = self.build_plan(frames, &plan);
         if result.is_err() {
-            self.release(frames);
+            self.release_frames(frames);
         }
         result
     }
@@ -45,7 +45,7 @@ impl AddressSpace {
         unsafe {
             core::arch::asm!("mov {}, cr4", out(reg) control, options(nomem, nostack));
         }
-        if control & (1 << 12) != 0 {
+        if control & ((1 << 12) | (1 << 17)) != 0 {
             return Err(MapError::InvalidAddress);
         }
         self.root = self.allocate(frames)?;
@@ -117,26 +117,57 @@ impl AddressSpace {
     }
 
     pub fn supervisor_leaf(&self, address: u64) -> Result<u64, MapError> {
+        self.supervisor_slot(address).map(|(_, _, entry)| entry)
+    }
+
+    fn supervisor_slot(&self, address: u64) -> Result<(u64, usize, u64), MapError> {
         let mut table = self.root;
         for shift in [39, 30, 21, 12] {
-            let entry = self.read_entry(table, ((address >> shift) & 511) as usize)?;
+            let index = ((address >> shift) & 511) as usize;
+            let entry = self.read_entry(table, index)?;
             if entry & PRESENT == 0 || entry & USER != 0 || (shift != 12 && entry & HUGE != 0) {
                 return Err(MapError::InvalidAddress);
             }
             if shift == 12 {
-                return Ok(entry);
+                return Ok((table, index, entry));
             }
             let next = entry & ADDRESS;
             if !self.owned[..self.count]
                 .iter()
                 .flatten()
-                .any(|frame| frame.physical() == next)
+                .any(|owned| owned.frame.physical() == next)
             {
                 return Err(MapError::InvalidAddress);
             }
             table = next;
         }
         Err(MapError::InvalidAddress)
+    }
+
+    pub(super) fn set_alias_write(
+        &mut self,
+        frame: &arkhe_kernel_core::frame_pool::Frame,
+        writable: bool,
+    ) -> Result<(), MapError> {
+        let physical = frame.physical();
+        let address = self.pointer(physical)? as u64;
+        let (table, index, entry) = self.supervisor_slot(address)?;
+        if entry & ADDRESS != physical || entry & NX == 0 || (entry & WRITE != 0) == writable {
+            return Err(MapError::InvalidAddress);
+        }
+        let entry = if writable {
+            entry | WRITE
+        } else {
+            entry & !WRITE
+        };
+        self.write_entry(table, index, entry)?;
+        // SAFETY: Only this IRQ-masked BSP changes the shared supervisor leaf.
+        // PCID/PGE are disabled: INVLPG covers this root; CR3 flushes inactive roots.
+        // The asm memory clobber keeps the PTE store before invalidation.
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+        }
+        Ok(())
     }
 }
 
@@ -291,6 +322,19 @@ pub fn expected_fault(vector: u64, error: u64, address: u64) -> bool {
         && vector == 14
         && address == expected
         && error == EXPECTED_ERROR.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "smoke")]
+pub fn trigger_alias_fault(address: u64) -> ! {
+    use core::sync::atomic::Ordering;
+    EXPECTED_ADDRESS.store(address, Ordering::Relaxed);
+    EXPECTED_ERROR.store(3, Ordering::Relaxed);
+    // SAFETY: The target is a retained user code frame's supervisor RO/NX alias.
+    // IRQs are masked and the installed IST handler must observe a write-protection fault.
+    unsafe {
+        core::arch::asm!("mov byte ptr [{address}], 0", address = in(reg) address);
+    }
+    panic!("user code direct map remained writable");
 }
 
 #[cfg(feature = "smoke")]
