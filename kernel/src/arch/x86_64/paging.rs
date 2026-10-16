@@ -1,5 +1,8 @@
+#[path = "paging/kernel.rs"]
 pub mod kernel;
+pub use kernel::KernelSpace;
 #[cfg(feature = "smoke")]
+#[path = "paging/probes.rs"]
 mod probes;
 
 use arkhe_kernel_core::elf::Executable;
@@ -26,9 +29,117 @@ pub enum MapError {
     AlreadyMapped,
     UnexpectedHugePage,
     WritableCode,
+    InvalidState,
+    WrongOwner,
+    ActiveAddressSpace,
 }
 
-pub struct AddressSpace {
+/// A reclaimable lower half bound to one retained supervisor owner.
+/// Dropping it does not release frames; teardown requires an inactive root and owner.
+pub struct UserSpace {
+    tables: Tables,
+    supervisor: u64,
+}
+
+impl UserSpace {
+    pub const fn new() -> Self {
+        Self {
+            tables: Tables::new(),
+            supervisor: 0,
+        }
+    }
+
+    /// # Safety
+    /// For a vacant space and built kernel, the IRQ-masked BSP exclusively owns
+    /// the pool and retains the active supervisor mappings with PCID/PGE disabled.
+    /// Invalid state or a missing owner is rejected before RAM or hardware access.
+    pub unsafe fn load<const N: usize>(
+        &mut self,
+        frames: &mut FramePool<N>,
+        kernel: &mut KernelSpace,
+        elf: &Executable<'_>,
+    ) -> Result<(), MapError> {
+        if self.supervisor != 0 || self.tables.count != 0 {
+            return Err(MapError::InvalidState);
+        }
+        if kernel.tables.root == 0 {
+            return Err(MapError::WrongOwner);
+        }
+        let users = kernel.users.checked_add(1).ok_or(MapError::NoMemory)?;
+        self.tables.direct_map = kernel.tables.direct_map;
+        // SAFETY: The caller grants exclusive RAM; the explicit owner retains shared tables.
+        let result = unsafe { self.tables.load_inner(frames, kernel.tables.root, elf) }
+            .and_then(|()| self.tables.finalize(&mut kernel.tables));
+        if result.is_err() {
+            self.tables.release(frames, &mut kernel.tables);
+        } else {
+            self.supervisor = kernel.tables.root;
+            kernel.users = users;
+        }
+        result
+    }
+
+    /// Refuse teardown before changing any mappings if the space is active, empty,
+    /// or bound to another supervisor. Successful teardown consumes the binding.
+    pub fn release<const N: usize>(
+        &mut self,
+        frames: &mut FramePool<N>,
+        kernel: &mut KernelSpace,
+    ) -> Result<(), MapError> {
+        if self.supervisor == 0 {
+            return Err(MapError::InvalidState);
+        }
+        if self.supervisor != kernel.tables.root || kernel.users == 0 {
+            return Err(MapError::WrongOwner);
+        }
+        if active_root() == self.tables.root {
+            return Err(MapError::ActiveAddressSpace);
+        }
+        self.tables.release(frames, &mut kernel.tables);
+        self.supervisor = 0;
+        kernel.users -= 1;
+        Ok(())
+    }
+
+    pub fn root(&self) -> u64 {
+        assert_ne!(self.supervisor, 0, "user root is not loaded");
+        self.tables.root
+    }
+
+    pub fn copy_from_user(&self, address: u64, destination: &mut [u8]) -> Result<(), MapError> {
+        self.require_loaded()?;
+        self.tables.copy_from_user(address, destination)
+    }
+
+    pub fn validate_write(&self, address: u64, length: usize) -> Result<(), MapError> {
+        if length != 0 {
+            self.require_loaded()?;
+        }
+        self.tables.validate_write(address, length)
+    }
+
+    pub fn copy_to_user(&self, address: u64, source: &[u8]) -> Result<(), MapError> {
+        if !source.is_empty() {
+            self.require_loaded()?;
+        }
+        self.tables.copy_to_user(address, source)
+    }
+
+    fn require_loaded(&self) -> Result<(), MapError> {
+        if self.supervisor == 0 {
+            Err(MapError::InvalidState)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "smoke")]
+    pub fn check_copy_permissions(&mut self) {
+        self.tables.check_copy_permissions();
+    }
+}
+
+struct Tables {
     root: u64,
     direct_map: u64,
     owned: [Option<OwnedFrame>; MAX_OWNED_FRAMES],
@@ -41,8 +152,8 @@ struct OwnedFrame {
     sealed: bool,
 }
 
-impl AddressSpace {
-    pub const fn new() -> Self {
+impl Tables {
+    const fn new() -> Self {
         Self {
             root: 0,
             direct_map: 0,
@@ -51,36 +162,15 @@ impl AddressSpace {
         }
     }
 
-    /// # Safety
-    /// The IRQ-masked BSP exclusively owns the pool. The active root shares the
-    /// retained `kernel` upper half, with PCID and global translations disabled.
-    /// This space is inactive and cannot run until loading and sealing succeed.
-    pub unsafe fn load<const N: usize>(
-        &mut self,
-        frames: &mut FramePool<N>,
-        kernel: &mut AddressSpace,
-        elf: &Executable<'_>,
-    ) -> Result<(), MapError> {
-        assert_eq!(self.count, 0, "address space already owns frames");
-        self.direct_map = kernel.direct_map;
-        // SAFETY: The caller provides exclusive usable RAM and unchanged kernel mappings.
-        let result = unsafe { self.load_inner(frames, elf) }.and_then(|()| self.finalize(kernel));
-        if result.is_err() {
-            self.release(frames, kernel);
-        }
-        result
-    }
-
     unsafe fn load_inner<const N: usize>(
         &mut self,
         frames: &mut FramePool<N>,
+        supervisor_root: u64,
         elf: &Executable<'_>,
     ) -> Result<(), MapError> {
-        let old_root: u64;
         let control: u64;
-        // SAFETY: Ring 0 reads CR3/CR4; the active root retains all supervisor tables.
+        // SAFETY: Ring 0 reads CR4; supervisor_root is the caller's retained owner.
         unsafe {
-            core::arch::asm!("mov {}, cr3", out(reg) old_root, options(nomem, nostack));
             core::arch::asm!("mov {}, cr4", out(reg) control, options(nomem, nostack));
         }
         if control & ((1 << 12) | (1 << 17)) != 0 || self.direct_map & (PAGE - 1) != 0 {
@@ -91,7 +181,7 @@ impl AddressSpace {
         self.root = root;
         self.zero(root)?;
         for index in 256..512 {
-            let value = self.read_entry(old_root & ADDRESS, index)? & !USER;
+            let value = self.read_entry(supervisor_root, index)? & !USER;
             self.write_entry(root, index, value)?;
         }
         for segment in elf.segments() {
@@ -109,11 +199,7 @@ impl AddressSpace {
     }
 
     /// Switch CR3 away from this root before returning any of its frames.
-    pub fn release<const N: usize>(
-        &mut self,
-        frames: &mut FramePool<N>,
-        kernel: &mut AddressSpace,
-    ) {
+    fn release<const N: usize>(&mut self, frames: &mut FramePool<N>, kernel: &mut Tables) {
         assert_ne!(
             active_root(),
             self.root,
@@ -173,11 +259,7 @@ impl AddressSpace {
         Ok(physical)
     }
 
-    pub fn root(&self) -> u64 {
-        self.root
-    }
-
-    pub fn copy_from_user(&self, address: u64, destination: &mut [u8]) -> Result<(), MapError> {
+    fn copy_from_user(&self, address: u64, destination: &mut [u8]) -> Result<(), MapError> {
         let end = address
             .checked_add(destination.len() as u64)
             .ok_or(MapError::InvalidAddress)?;
@@ -203,7 +285,7 @@ impl AddressSpace {
         Ok(())
     }
 
-    pub fn validate_write(&self, address: u64, length: usize) -> Result<(), MapError> {
+    fn validate_write(&self, address: u64, length: usize) -> Result<(), MapError> {
         if length == 0 {
             return Ok(());
         }
@@ -224,7 +306,7 @@ impl AddressSpace {
 
     /// Validate every destination page before writing any bytes. IRQs stay masked,
     /// and only this kernel owns the tables, so the second walk cannot race unmapping.
-    pub fn copy_to_user(&self, address: u64, source: &[u8]) -> Result<(), MapError> {
+    fn copy_to_user(&self, address: u64, source: &[u8]) -> Result<(), MapError> {
         self.validate_write(address, source.len())?;
         let mut done = 0;
         while done < source.len() {
@@ -243,7 +325,7 @@ impl AddressSpace {
     }
 
     #[cfg(feature = "smoke")]
-    pub fn check_copy_permissions(&mut self) {
+    fn check_copy_permissions(&mut self) {
         assert_ne!(
             active_root(),
             self.root,
@@ -333,7 +415,7 @@ impl AddressSpace {
         Ok((table, index, entry))
     }
 
-    fn finalize(&mut self, kernel: &mut AddressSpace) -> Result<(), MapError> {
+    fn finalize(&mut self, kernel: &mut Tables) -> Result<(), MapError> {
         assert_ne!(active_root(), self.root, "cannot finalize an active root");
         for slot in 0..self.count {
             let owned = self.owned[slot].as_ref().expect("owned frame");

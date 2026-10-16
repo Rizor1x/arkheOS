@@ -1,4 +1,4 @@
-use super::{ADDRESS, AddressSpace, HUGE, MapError, NX, PAGE, PRESENT, USER, WRITE};
+use super::{ADDRESS, HUGE, MapError, NX, PAGE, PRESENT, Tables, USER, WRITE};
 use crate::boot::BootMemory;
 use arkhe_kernel_core::frame_pool::FramePool;
 use arkhe_kernel_core::mapping::{Mapping, MappingPlan};
@@ -14,12 +14,81 @@ unsafe extern "C" {
 
 const PLAN_ENTRIES: usize = crate::boot::MAX_REGIONS + 6;
 
-impl AddressSpace {
+/// Owns supervisor tables retained for the kernel lifetime. There is no release API:
+/// user roots borrow their upper half and cannot return these leases to the pool.
+pub struct KernelSpace {
+    pub(super) tables: Tables,
+    pub(super) users: usize,
+}
+
+impl KernelSpace {
+    pub const fn new() -> Self {
+        Self {
+            tables: Tables::new(),
+            users: 0,
+        }
+    }
+
+    /// # Safety
+    /// For an unbuilt owner, the IRQ-masked BSP owns the pool and runs on valid
+    /// Limine mappings; boot/linker regions describe retained RAM. A built owner
+    /// is rejected before accessing the pool, boot responses, or CPU state.
+    pub unsafe fn build_kernel<const N: usize>(
+        &mut self,
+        frames: &mut FramePool<N>,
+        boot: &BootMemory,
+    ) -> Result<(), MapError> {
+        if self.tables.count != 0 || self.tables.root != 0 || self.users != 0 {
+            return Err(MapError::InvalidState);
+        }
+        // SAFETY: The caller supplies exclusive boot RAM and retained linker/module regions.
+        unsafe { self.tables.build_kernel(frames, boot) }
+    }
+
+    pub fn root(&self) -> u64 {
+        assert_ne!(self.tables.root, 0, "kernel root is not built");
+        self.tables.root
+    }
+
+    pub fn table_frames(&self) -> usize {
+        self.tables.count
+    }
+
+    pub fn user_roots(&self) -> usize {
+        self.users
+    }
+
+    #[cfg(feature = "smoke")]
+    pub fn supervisor_leaf(&self, address: u64) -> Result<u64, MapError> {
+        self.tables.supervisor_leaf(address)
+    }
+
+    #[cfg(feature = "smoke")]
+    pub fn check_retained_owner<const N: usize>(
+        &mut self,
+        frames: &mut FramePool<N>,
+        boot: &BootMemory,
+    ) {
+        let root = self.root();
+        let live = frames.live_count();
+        let tables = self.table_frames();
+        // SAFETY: A built owner is rejected before boot, RAM, or CPU access.
+        let result = unsafe { self.build_kernel(frames, boot) };
+        assert_eq!(result, Err(MapError::InvalidState));
+        assert_eq!(self.root(), root);
+        assert_eq!(super::active_root(), root);
+        assert_eq!(self.table_frames(), tables);
+        assert_eq!(self.user_roots(), 0);
+        assert_eq!(frames.live_count(), live);
+    }
+}
+
+impl Tables {
     /// Construct an inactive supervisor root from an explicit boot mapping plan.
     /// # Safety
     /// The BSP has IRQs masked, owns `frames`, and still runs on Limine mappings.
     /// Linker regions, executable bases and module bytes must describe retained RAM.
-    pub unsafe fn build_kernel<const N: usize>(
+    unsafe fn build_kernel<const N: usize>(
         &mut self,
         frames: &mut FramePool<N>,
         boot: &BootMemory,
@@ -112,11 +181,7 @@ impl AddressSpace {
         Ok(())
     }
 
-    pub fn table_frames(&self) -> usize {
-        self.count
-    }
-
-    pub fn supervisor_leaf(&self, address: u64) -> Result<u64, MapError> {
+    fn supervisor_leaf(&self, address: u64) -> Result<u64, MapError> {
         self.supervisor_slot(address).map(|(_, _, entry)| entry)
     }
 
@@ -276,7 +341,7 @@ pub fn check_rollback(boot: &BootMemory) {
     frames
         .initialize(boot.ranges())
         .expect("kernel rollback pool");
-    let mut space = AddressSpace::new();
+    let mut space = KernelSpace::new();
     // SAFETY: Before the main pool issues any frames, this temporary pool alone
     // owns usable RAM. build_kernel releases every lease on its forced failure.
     let result = unsafe { space.build_kernel(&mut frames, boot) };

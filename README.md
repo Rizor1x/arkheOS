@@ -83,7 +83,9 @@ cargo xtask smoke-processes
 ```
 
 `check` runs formatting, Clippy, host tests, kernel/application builds, and ELF
-and repository checks. `smoke` boots the kernel and supervisor, verifies child
+and repository checks. It also type-checks the real paging modules, accepting
+valid kernel/user roles and rejecting five invalid operations or owner types.
+`smoke` boots the kernel and supervisor, verifies child
 outcomes, and requires full resource reclamation within 30 seconds.
 Each userspace test runs two rounds with fresh address spaces. Smoke builds
 also exhaust a small frame pool during ELF loading and require complete rollback.
@@ -102,6 +104,11 @@ Two more cases attempt to write user code through its supervisor direct-map
 alias, before and after switching to another process root. Every smoke boot
 requires a partial-sealing rollback, writable reuse and full-page zeroing of a
 released code frame, and two successful load/seal/release cycles.
+Every smoke also rejects rebuilding the retained kernel root, loading a live
+user space twice, using a missing/wrong owner, overflowing the user-root count,
+releasing the active root, and releasing the same space twice. Rejected teardown
+must preserve frame counts and code protection. Nonempty copies through a
+released user space are refused before accessing page tables.
 
 `smoke-userspace` verifies that user code cannot read mapped kernel memory,
 execute privileged instructions, write its RX code, execute its NX stack, or use
@@ -199,6 +206,11 @@ Kernel page-table frames stay owned for the kernel lifetime and share the
 4,096-frame pool with processes. At 256 MiB QEMU RAM, the kernel retains 134 table
 frames. Each process round must release all remaining frames. Kernel table
 storage is bounded to 1,100 frames; larger memory layouts can fail construction.
+`KernelSpace` retains supervisor tables and exposes no process load/release API.
+`UserSpace` owns reclaimable process pages and binds to that supervisor only
+after a successful load. The loader copies the explicit owner's upper half;
+teardown checks that owner and refuses the active root before changing mappings.
+User-root bindings are counted and must return to zero at the end of each round.
 User image pages remain non-executable during loading. Before enabling execution,
 the loader makes each code frame's shared supervisor alias RO/NX and invalidates
 its cached translation. Code is therefore RX only after writable aliases are gone.

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 const TARGET: &str = "x86_64-unknown-none";
 const MEMORY_CHECK_MARKER: &str = "memory: executable sealing rollback and reuse verified";
+const OWNERSHIP_CHECK_MARKER: &str = "memory: kernel and user root ownership verified";
 
 fn main() {
     if let Err(error) = dispatch() {
@@ -106,6 +107,7 @@ fn run(command: &mut Command) -> Result {
 
 fn check() -> Result {
     run(Command::new("cargo").args(["fmt", "--all", "--", "--check"]))?;
+    run(Command::new("rustfmt").args(["--edition", "2024", "--check", "tests/paging_api.rs"]))?;
     run(Command::new("cargo").args(["test", "--locked"]))?;
     run(Command::new("cargo").args([
         "clippy",
@@ -146,6 +148,7 @@ fn check() -> Result {
         ]))?;
     build_userspace("boot")?;
     build(false, "boot")?;
+    run(Command::new("python3").arg("tools/check_paging_api.py"))?;
     run(Command::new("python3").arg("tools/audit_repo.py"))
 }
 
@@ -468,6 +471,9 @@ fn smoke_output_valid(case: &str, marker: &str, text: &str) -> bool {
             == 2;
     orphan_verified
         && text.lines().any(|line| line.trim() == MEMORY_CHECK_MARKER)
+        && text
+            .lines()
+            .any(|line| line.trim() == OWNERSHIP_CHECK_MARKER)
         && text.lines().any(|line| line.trim() == marker)
         && !text.contains("PANIC:")
 }
@@ -503,13 +509,13 @@ fn doctor() -> Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{MEMORY_CHECK_MARKER, smoke_output_valid};
+    use super::{MEMORY_CHECK_MARKER, OWNERSHIP_CHECK_MARKER, smoke_output_valid};
 
     #[test]
     fn process_smoke_requires_both_unwatched_child_confirmations() {
         let marker = "ARKHE_PROCESS_OK";
         let one = "service: orphan observed parent closure\r\n";
-        let memory = format!("{MEMORY_CHECK_MARKER}\r\n");
+        let memory = format!("{MEMORY_CHECK_MARKER}\r\n{OWNERSHIP_CHECK_MARKER}\r\n");
         assert!(!smoke_output_valid(
             "spawn",
             marker,
@@ -541,20 +547,30 @@ mod tests {
     }
 
     #[test]
-    fn smoke_requires_completed_memory_checks() {
+    fn smoke_requires_completed_memory_and_ownership_checks() {
         let marker = "ARKHE_KERNEL_MAPPING_OK";
         for case in ["kernel-write-code", "user-code-alias", "ipc", "divide"] {
             assert!(!smoke_output_valid(case, marker, marker));
             assert!(!smoke_output_valid(
                 case,
                 marker,
-                &format!("prefix {MEMORY_CHECK_MARKER}\n{marker}")
+                &format!("{MEMORY_CHECK_MARKER}\n{marker}")
+            ));
+            assert!(!smoke_output_valid(
+                case,
+                marker,
+                &format!("{OWNERSHIP_CHECK_MARKER}\n{marker}")
+            ));
+            assert!(!smoke_output_valid(
+                case,
+                marker,
+                &format!("prefix {MEMORY_CHECK_MARKER}\n{OWNERSHIP_CHECK_MARKER}\n{marker}")
             ));
             assert!(!smoke_output_valid(case, marker, MEMORY_CHECK_MARKER));
             assert!(smoke_output_valid(
                 case,
                 marker,
-                &format!("{MEMORY_CHECK_MARKER}\r\n{marker}\r\n")
+                &format!("{MEMORY_CHECK_MARKER}\r\n{OWNERSHIP_CHECK_MARKER}\r\n{marker}\r\n")
             ));
         }
     }

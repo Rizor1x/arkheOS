@@ -21,7 +21,7 @@ use arkhe_kernel_core::scheduler::Scheduler;
 use crate::arch::x86_64::{
     self as cpu,
     exceptions::ExceptionFrame,
-    paging::{self, AddressSpace, POOL_FRAMES, STACK_TOP},
+    paging::{self, KernelSpace, POOL_FRAMES, STACK_TOP, UserSpace},
 };
 
 #[derive(Clone, Copy)]
@@ -55,7 +55,7 @@ enum Wait {
 }
 
 struct Process {
-    space: AddressSpace,
+    space: UserSpace,
     capabilities: CapabilityTable<8, Resource>,
     context: ExceptionFrame,
     ticks: u64,
@@ -65,7 +65,7 @@ struct Process {
 impl Process {
     const fn new() -> Self {
         Self {
-            space: AddressSpace::new(),
+            space: UserSpace::new(),
             capabilities: CapabilityTable::new(),
             context: ExceptionFrame::EMPTY,
             ticks: 0,
@@ -86,8 +86,7 @@ struct State {
     idle_entries: u64,
     image: Option<Executable<'static>>,
     filesystem: Option<ReadOnlyFs<'static>>,
-    kernel_root: u64,
-    kernel_space: AddressSpace,
+    kernel_space: KernelSpace,
     direct_map: u64,
     round: u64,
     completed: usize,
@@ -112,8 +111,7 @@ static STATE: ProcessStorage = ProcessStorage(UnsafeCell::new(State {
     idle_entries: 0,
     image: None,
     filesystem: None,
-    kernel_root: 0,
-    kernel_space: AddressSpace::new(),
+    kernel_space: KernelSpace::new(),
     direct_map: 0,
     round: 0,
     completed: 0,
@@ -172,10 +170,9 @@ pub fn launch(
         // private bootstrap stack remain retained across the new supervisor root.
         unsafe { state.kernel_space.build_kernel(&mut state.frames, memory) }
             .expect("owned kernel mappings");
-        state.kernel_root = state.kernel_space.root();
         // SAFETY: The validated plan retains this code, stack, ISTs and module.
         unsafe {
-            paging::switch(state.kernel_root);
+            paging::switch(state.kernel_space.root());
         }
         cpu::write_console(format_args!(
             "memory: owned kernel root, {} table frames, kernel RX/RW-NX\n",
@@ -183,6 +180,9 @@ pub fn launch(
         ));
         #[cfg(feature = "smoke")]
         {
+            state
+                .kernel_space
+                .check_retained_owner(&mut state.frames, memory);
             state.processes[0].space.check_load_lifecycle(
                 &mut state.frames,
                 &mut state.kernel_space,
@@ -190,6 +190,9 @@ pub fn launch(
             );
             cpu::write_console(format_args!(
                 "memory: executable sealing rollback and reuse verified\n"
+            ));
+            cpu::write_console(format_args!(
+                "memory: kernel and user root ownership verified\n"
             ));
             paging::kernel::trigger_fault(memory);
             cpu::exceptions::trigger_test_fault();
@@ -249,6 +252,7 @@ fn check_load_rollback(state: &mut State, ranges: &[FrameRange]) {
 }
 
 fn spawn_round(state: &mut State) {
+    assert_eq!(state.kernel_space.user_roots(), 0, "retained user binding");
     assert_eq!(
         state.frames.live_count(),
         state.kernel_space.table_frames(),
@@ -458,6 +462,11 @@ fn wake(state: &mut State, slot: usize, result: i64) {
 }
 
 fn restore(state: &mut State, frame: &mut ExceptionFrame) {
+    assert_eq!(
+        state.kernel_space.user_roots(),
+        state.scheduler.live_count(),
+        "user root ownership"
+    );
     let root = if let Some(slot) = state.scheduler.current() {
         let process = &state.processes[slot];
         *frame = process.context;
@@ -465,7 +474,7 @@ fn restore(state: &mut State, frame: &mut ExceptionFrame) {
     } else {
         *frame = ExceptionFrame::idle();
         state.idle_entries = state.idle_entries.saturating_add(1);
-        state.kernel_root
+        state.kernel_space.root()
     };
     if paging::active_root() != root {
         // SAFETY: All roots retain supervisor/IST mappings. Rust borrows end on
@@ -500,7 +509,9 @@ fn retire(state: &mut State, frame: &mut ExceptionFrame, outcome: u64) {
     let root = state
         .scheduler
         .current()
-        .map_or(state.kernel_root, |next| state.processes[next].space.root());
+        .map_or(state.kernel_space.root(), |next| {
+            state.processes[next].space.root()
+        });
     // SAFETY: The next process or retained owned kernel root keeps all kernel/IST mappings.
     // Switching first flushes the outgoing non-global TLB entries before reclamation.
     unsafe {
@@ -508,9 +519,11 @@ fn retire(state: &mut State, frame: &mut ExceptionFrame, outcome: u64) {
     }
     state.processes[slot]
         .space
-        .release(&mut state.frames, &mut state.kernel_space);
+        .release(&mut state.frames, &mut state.kernel_space)
+        .expect("inactive process teardown");
     state.processes[slot].capabilities = CapabilityTable::new();
     if state.scheduler.live_count() == 0 {
+        assert_eq!(state.kernel_space.user_roots(), 0, "user root leak");
         assert_eq!(state.endpoints.live_count(), 0, "endpoint leak");
         assert_eq!(state.completions.live_count(), 0, "completion leak");
         assert_eq!(
