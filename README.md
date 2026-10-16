@@ -14,6 +14,8 @@ Implemented:
 
 - COM1 console, GDT/TSS/IDT, and dedicated exception stacks;
 - validated usable RAM ranges, owned frame leases, and per-process page tables;
+- an owned supervisor root, checked boot mappings, kernel RX/RO/RW-NX regions,
+  and a private bootstrap stack with an unmapped guard;
 - single-CPU round-robin preemption, voluntary yield, timer sleep, and interrupt-driven idle;
 - capability-checked message delivery, blocked receivers, and peer-close wakeups;
 - channel creation through explicit authority, with transactional descriptor allocation;
@@ -28,8 +30,8 @@ Implemented:
 - page reclamation on exit/fault and rollback of partially loaded executables;
 - host tests and real kernel/user fault injection under BIOS and UEFI QEMU.
 
-Execution uses one CPU with at most four live processes. Kernel higher-half
-mappings are inherited from Limine; APIC and SMP are not implemented. Children
+Execution uses one CPU with at most four live processes. Process roots share
+the kernel-owned supervisor mappings; APIC and SMP are not implemented. Children
 receive only an explicitly granted console and channel sides, without namespace,
 channel-creation, or process-creation authority. Persistent storage,
 Rust `std`, Python, and a desktop are not supported yet. The kernel is
@@ -70,6 +72,7 @@ Output appears in the serial console. Stop QEMU with Ctrl+C.
 cargo xtask check
 cargo xtask smoke
 cargo xtask smoke-exceptions
+cargo xtask smoke-mappings
 cargo xtask smoke-userspace
 cargo xtask smoke-scheduler
 cargo xtask smoke-ipc
@@ -83,8 +86,15 @@ Each userspace test runs two rounds with fresh address spaces. Smoke builds
 also exhaust a small frame pool during ELF loading and require complete rollback.
 
 `smoke-exceptions` raises real divide, page, and double faults. The double-fault
-handler must execute on its independent emergency stack. Every boot also checks
+handler must execute on its independent emergency stack. These exceptions run
+after switching to the owned kernel root. Every boot also checks
 register and flag restoration after a returning breakpoint.
+
+`smoke-mappings` requires real page faults when the kernel writes its RX code,
+uses the absent direct-map address of that code, executes RW/NX data, reads the
+bootstrap stack guard, or writes the read-only initramfs. Each fault must match
+the expected vector, address, and access flags. Every smoke boot also exhausts
+a four-frame kernel-table pool and requires complete construction rollback.
 
 `smoke-userspace` verifies that user code cannot read mapped kernel memory,
 execute privileged instructions, write its RX code, execute its NX stack, or use
@@ -154,6 +164,29 @@ builds `build/normal/arkheOS.iso`; each smoke case uses a separate build directo
 The initramfs contains only explicitly selected files, with reproducible metadata.
 
 Local Git checks can be installed with `cargo xtask hooks`.
+
+## Kernel memory
+
+The kernel builds its own four-level page tables before starting applications.
+A checked plan rejects virtual overlaps, physical aliases, invalid addresses,
+and writable executable mappings. Kernel text is RX, constants are RO/NX,
+and writable data and stacks are RW/NX. The 256 KiB bootstrap stack has an
+unmapped lower guard page; exception and idle stacks remain separate.
+
+The supervisor direct map contains usable RAM as RW/NX and the retained initramfs
+as RO/NX. The kernel image has no direct-map alias. Bootloader tables, response
+storage, the old stack, framebuffer, reserved ranges, and device memory are not
+inherited. The current console and timer use port I/O. Bootloader-reclaimable
+memory remains reserved; this change does not reclaim it.
+
+Kernel page-table frames stay owned for the kernel lifetime and share the
+4,096-frame pool with processes. At 256 MiB QEMU RAM, the kernel retains 134 table
+frames. Each process round must release all remaining frames. Kernel table
+storage is bounded to 1,100 frames; larger memory layouts can fail construction.
+User RX pages still have writable supervisor direct-map aliases used by the
+loader. Their load/finalize/release protection is the next memory step; complete
+system-wide W^X, runtime mapping APIs, SMP, and per-CPU TLB synchronization are
+not implemented.
 
 ## Filesystem
 

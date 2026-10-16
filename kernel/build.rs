@@ -7,7 +7,12 @@ fn main() {
     let case = std::env::var("ARKHE_TEST_CASE").unwrap_or_else(|_| "boot".into());
     assert!(matches!(
         case.as_str(),
-        "boot"
+        "kernel-write-code"
+            | "kernel-write-alias"
+            | "kernel-exec-data"
+            | "kernel-stack-guard"
+            | "kernel-write-module"
+            | "boot"
             | "spawn"
             | "ipc"
             | "ipc-peer-fault"

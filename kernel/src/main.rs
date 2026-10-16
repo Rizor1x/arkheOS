@@ -5,13 +5,35 @@ mod arch;
 mod boot;
 mod user;
 
+// The entry stack belongs to the kernel image, so the CR3 handoff can discard
+// every bootloader mapping without retaining a live Limine stack frame.
+core::arch::global_asm!(
+    ".section .bss",
+    ".balign 4096",
+    ".global arkhe_boot_guard",
+    "arkhe_boot_guard:",
+    ".skip 4096",
+    ".global arkhe_boot_stack",
+    "arkhe_boot_stack:",
+    ".skip 262144",
+    "arkhe_boot_stack_top:",
+    ".section .text",
+    ".global _start",
+    "_start:",
+    "cli",
+    "lea rsp, [rip + arkhe_boot_stack_top]",
+    "xor ebp, ebp",
+    "call arkhe_boot",
+    "ud2",
+);
+
 use arch::x86_64 as cpu;
 use arkhe_abi::{Error, Message};
 use arkhe_kernel_core::capability::{CapabilityTable, ObjectId, Rights};
 use arkhe_kernel_core::ipc::MessageQueue;
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn arkhe_boot() -> ! {
     cpu::disable_interrupts();
     cpu::init_console();
     cpu::exceptions::init();
@@ -30,8 +52,6 @@ pub extern "C" fn _start() -> ! {
     cpu::write_console(format_args!(
         "exceptions: GDT/TSS/IDT loaded, breakpoint restored\n"
     ));
-    #[cfg(feature = "smoke")]
-    cpu::exceptions::trigger_test_fault();
     cpu::write_console(format_args!("ARKHE_BOOT_OK\n"));
     let archive =
         arkhe_kernel_core::initramfs::Archive::new(boot::initramfs().expect("initramfs module"))
@@ -48,12 +68,7 @@ pub extern "C" fn _start() -> ! {
     let executable =
         arkhe_kernel_core::elf::Executable::parse(archive.read(path).expect("boot program"))
             .expect("invalid boot ELF");
-    user::launch(
-        memory.ranges(),
-        memory.direct_map_offset,
-        executable,
-        archive,
-    );
+    user::launch(&memory, executable, archive);
 }
 
 fn check_core() -> Result<(), Error> {

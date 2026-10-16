@@ -301,6 +301,11 @@ extern "C" fn arkhe_exception_dispatch(frame: &mut ExceptionFrame) {
         frame.vector, frame.error, frame.instruction
     ));
     #[cfg(feature = "smoke")]
+    if super::paging::kernel::expected_fault(frame.vector, frame.error, fault_address) {
+        write_console(format_args!("ARKHE_KERNEL_MAPPING_OK\n"));
+        super::exit_test(0x10);
+    }
+    #[cfg(feature = "smoke")]
     if expected_fault(frame, fault_address) {
         let marker = match frame.vector {
             0 => "ARKHE_DIVIDE_OK",

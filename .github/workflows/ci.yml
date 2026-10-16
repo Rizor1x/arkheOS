@@ -29,6 +29,7 @@ jobs:
       - name: BIOS kernel and userspace checks
         run: |
           cargo xtask smoke
+          cargo xtask smoke-mappings
           cargo xtask smoke-exceptions
           cargo xtask smoke-userspace
           cargo xtask smoke-scheduler
@@ -40,6 +41,7 @@ jobs:
           ARKHE_OVMF_VARS: /usr/share/OVMF/OVMF_VARS_4M.fd
         run: |
           cargo xtask smoke
+          cargo xtask smoke-mappings
           cargo xtask smoke-exceptions
           cargo xtask smoke-userspace
           cargo xtask smoke-scheduler

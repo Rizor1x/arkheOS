@@ -26,7 +26,7 @@ fn dispatch() -> Result {
     match task {
         "help" if args.len() <= 1 => {
             println!(
-                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|smoke-userspace|smoke-scheduler|smoke-ipc|smoke-processes|audit|hooks|doctor>"
+                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|smoke-mappings|smoke-userspace|smoke-scheduler|smoke-ipc|smoke-processes|audit|hooks|doctor>"
             );
             Ok(())
         }
@@ -37,6 +37,18 @@ fn dispatch() -> Result {
         "iso" => iso(false, "boot").map(|_| ()),
         "run" => run_qemu(),
         "smoke" => smoke("boot", "ARKHE_USER_OK"),
+        "smoke-mappings" => {
+            for case in [
+                "kernel-write-code",
+                "kernel-write-alias",
+                "kernel-exec-data",
+                "kernel-stack-guard",
+                "kernel-write-module",
+            ] {
+                smoke(case, "ARKHE_KERNEL_MAPPING_OK")?;
+            }
+            Ok(())
+        }
         "smoke-processes" => smoke("spawn", "ARKHE_PROCESS_OK"),
         "smoke-ipc" => {
             smoke("ipc", "ARKHE_IPC_OK")?;

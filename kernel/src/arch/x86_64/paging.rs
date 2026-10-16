@@ -1,3 +1,5 @@
+pub mod kernel;
+
 use arkhe_kernel_core::elf::Executable;
 use arkhe_kernel_core::frame_pool::{Frame, FramePool};
 
@@ -42,7 +44,8 @@ impl AddressSpace {
     }
 
     /// # Safety
-    /// The allocator must exclusively own usable RAM mapped at `direct_map` by Limine.
+    /// The allocator must exclusively own usable RAM mapped at `direct_map` by the
+    /// retained supervisor root (Limine during the pre-switch rollback probe).
     /// No other CPU may change the inherited kernel mappings while this space is alive.
     pub unsafe fn load<const N: usize>(
         &mut self,
@@ -67,7 +70,7 @@ impl AddressSpace {
     ) -> Result<(), MapError> {
         let old_root: u64;
         let control: u64;
-        // SAFETY: Ring 0 reads CR3/CR4; the active root is retained by Limine.
+        // SAFETY: Ring 0 reads CR3/CR4; the active root retains all supervisor tables.
         unsafe {
             core::arch::asm!("mov {}, cr3", out(reg) old_root, options(nomem, nostack));
             core::arch::asm!("mov {}, cr4", out(reg) control, options(nomem, nostack));
@@ -333,7 +336,7 @@ impl AddressSpace {
 
     fn read_entry(&self, table: u64, index: usize) -> Result<u64, MapError> {
         let address = self.pointer(table)? as *const u64;
-        // SAFETY: Table frames are either retained Limine tables or owned zeroed pages;
+        // SAFETY: Table frames are retained supervisor tables or owned zeroed pages;
         // indices are masked to 0..512, and HHDM preserves their page alignment.
         Ok(unsafe { address.add(index).read_volatile() })
     }

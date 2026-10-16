@@ -9,5 +9,6 @@ pub mod filesystem;
 pub mod frame_pool;
 pub mod initramfs;
 pub mod ipc;
+pub mod mapping;
 pub mod memory;
 pub mod scheduler;

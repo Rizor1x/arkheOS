@@ -14,6 +14,7 @@ use arkhe_kernel_core::endpoint::{EndpointId, Endpoints};
 use arkhe_kernel_core::filesystem::{OpenFile, ReadOnlyFs};
 use arkhe_kernel_core::frame_pool::FramePool;
 use arkhe_kernel_core::initramfs::Archive;
+#[cfg(feature = "smoke")]
 use arkhe_kernel_core::memory::FrameRange;
 use arkhe_kernel_core::scheduler::Scheduler;
 
@@ -86,6 +87,7 @@ struct State {
     image: Option<Executable<'static>>,
     filesystem: Option<ReadOnlyFs<'static>>,
     kernel_root: u64,
+    kernel_space: AddressSpace,
     direct_map: u64,
     round: u64,
     completed: usize,
@@ -111,6 +113,7 @@ static STATE: ProcessStorage = ProcessStorage(UnsafeCell::new(State {
     image: None,
     filesystem: None,
     kernel_root: 0,
+    kernel_space: AddressSpace::new(),
     direct_map: 0,
     round: 0,
     completed: 0,
@@ -143,11 +146,12 @@ fn state() -> &'static mut State {
 }
 
 pub fn launch(
-    ranges: &[FrameRange],
-    direct_map: u64,
+    memory: &crate::boot::BootMemory,
     elf: Executable<'static>,
     archive: Archive<'static>,
 ) -> ! {
+    let ranges = memory.ranges();
+    let direct_map = memory.direct_map_offset;
     cpu::disable_interrupts();
     assert!(
         !INITIALIZED.swap(true, Ordering::AcqRel),
@@ -156,12 +160,32 @@ pub fn launch(
     let (root, context) = {
         let state = state();
         state.frames.initialize(ranges).expect("usable frame pool");
-        state.kernel_root = paging::active_root();
         state.direct_map = direct_map;
         state.image = Some(elf);
         state.filesystem = Some(ReadOnlyFs::new(archive));
         #[cfg(feature = "smoke")]
-        check_load_rollback(state, ranges);
+        {
+            check_load_rollback(state, ranges);
+            paging::kernel::check_rollback(memory);
+        }
+        // SAFETY: One IRQ-masked BSP owns the pool; the boot image/module and
+        // private bootstrap stack remain retained across the new supervisor root.
+        unsafe { state.kernel_space.build_kernel(&mut state.frames, memory) }
+            .expect("owned kernel mappings");
+        state.kernel_root = state.kernel_space.root();
+        // SAFETY: The validated plan retains this code, stack, ISTs and module.
+        unsafe {
+            paging::switch(state.kernel_root);
+        }
+        cpu::write_console(format_args!(
+            "memory: owned kernel root, {} table frames, kernel RX/RW-NX\n",
+            state.kernel_space.table_frames()
+        ));
+        #[cfg(feature = "smoke")]
+        {
+            paging::kernel::trigger_fault(memory);
+            cpu::exceptions::trigger_test_fault();
+        }
         spawn_round(state);
         #[cfg(feature = "smoke")]
         state.processes[0].space.check_copy_permissions();
@@ -200,7 +224,11 @@ fn check_load_rollback(state: &mut State, ranges: &[FrameRange]) {
 }
 
 fn spawn_round(state: &mut State) {
-    assert_eq!(state.frames.live_count(), 0, "previous round leaked frames");
+    assert_eq!(
+        state.frames.live_count(),
+        state.kernel_space.table_frames(),
+        "previous round leaked frames"
+    );
     assert_eq!(state.endpoints.live_count(), 0, "endpoint leak");
     assert_eq!(state.completions.live_count(), 0, "completion leak");
     if supervised() {
@@ -448,7 +476,7 @@ fn retire(state: &mut State, frame: &mut ExceptionFrame, outcome: u64) {
         .scheduler
         .current()
         .map_or(state.kernel_root, |next| state.processes[next].space.root());
-    // SAFETY: The next process or original boot root retains all kernel/IST mappings.
+    // SAFETY: The next process or retained owned kernel root keeps all kernel/IST mappings.
     // Switching first flushes the outgoing non-global TLB entries before reclamation.
     unsafe {
         paging::switch(root);
@@ -458,7 +486,11 @@ fn retire(state: &mut State, frame: &mut ExceptionFrame, outcome: u64) {
     if state.scheduler.live_count() == 0 {
         assert_eq!(state.endpoints.live_count(), 0, "endpoint leak");
         assert_eq!(state.completions.live_count(), 0, "completion leak");
-        assert_eq!(state.frames.live_count(), 0, "process frame leak");
+        assert_eq!(
+            state.frames.live_count(),
+            state.kernel_space.table_frames(),
+            "process frame leak"
+        );
         cpu::write_console(format_args!(
             "memory: round {} reclaimed all process frames\n",
             state.round
