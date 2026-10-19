@@ -32,12 +32,12 @@ def artifacts():
         if item.get("reason") != "compiler-artifact":
             continue
         name = item["target"]["name"]
-        if name in {"arkhe_kernel_core", "limine"}:
+        if name in {"arkhe_abi", "arkhe_kernel_core", "limine"}:
             paths = [pathlib.Path(p) for p in item["filenames"] if p.endswith(".rlib")]
             if len(paths) != 1:
                 raise RuntimeError("ambiguous dependency artifact: " + name)
             libraries[name] = paths[0]
-    if libraries.keys() != {"arkhe_kernel_core", "limine"}:
+    if libraries.keys() != {"arkhe_abi", "arkhe_kernel_core", "limine"}:
         raise RuntimeError("missing kernel dependency artifacts")
     return libraries
 

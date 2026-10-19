@@ -2,6 +2,68 @@ use super::{KernelSpace, MapError, NX, PAGE, UserSpace, WRITE, active_root, swit
 use arkhe_kernel_core::{elf::Executable, frame_pool::FramePool};
 
 impl UserSpace {
+    pub fn check_heap_lifecycle(
+        &mut self,
+        frames: &mut FramePool<{ super::POOL_FRAMES }>,
+        kernel: &mut KernelSpace,
+        image: &Executable<'_>,
+    ) {
+        use arkhe_abi::PRIVATE_HEAP_BASE;
+        let baseline = frames.live_count();
+        assert_eq!(self.resize_heap(frames, 1), Err(MapError::InvalidState));
+        // SAFETY: The vacant test slot and pool are exclusively owned by this BSP.
+        unsafe { self.load(frames, kernel, image) }.expect("heap probe image");
+        assert_eq!(self.resize_heap(frames, 1), Err(MapError::InvalidState));
+        let root = self.root();
+        // SAFETY: The loaded root retains kernel text, stack, and all supervisor state.
+        unsafe { switch(root) };
+        self.resize_heap(frames, 1).expect("initial private page");
+        self.copy_to_user(PRIVATE_HEAP_BASE, b"retained")
+            .expect("heap write");
+        let live = frames.live_count();
+        let mut held = [const { None }; super::POOL_FRAMES];
+        let mut count = 0;
+        while let Some(frame) = frames.allocate() {
+            held[count] = Some(frame);
+            count += 1;
+        }
+        assert!(count > 2);
+        for _ in 0..2 {
+            count -= 1;
+            frames
+                .release(held[count].take().expect("held frame"))
+                .expect("test ownership");
+        }
+        let exhausted = frames.live_count();
+        assert_eq!(self.resize_heap(frames, 4), Err(MapError::NoMemory));
+        assert_eq!(frames.live_count(), exhausted, "partial heap growth leaked");
+        assert_eq!(self.heap.pages, 1);
+        assert!(self.tables.walk(PRIVATE_HEAP_BASE + PAGE, false).is_err());
+        let mut bytes = [0; 8];
+        self.copy_from_user(PRIVATE_HEAP_BASE, &mut bytes)
+            .expect("preserved heap");
+        assert_eq!(&bytes, b"retained");
+        for frame in held[..count].iter_mut() {
+            frames
+                .release(frame.take().expect("held frame"))
+                .expect("test ownership");
+        }
+        assert_eq!(frames.live_count(), live);
+        self.resize_heap(frames, 4)
+            .expect("growth after exhaustion");
+        self.resize_heap(frames, 0).expect("active heap shrink");
+        assert_eq!(self.heap.pages, 0);
+        assert!(self.tables.walk(PRIVATE_HEAP_BASE, false).is_err());
+        self.resize_heap(frames, 2).expect("heap teardown fixture");
+        // SAFETY: The retained kernel root shares this code/stack and flushes user translations.
+        unsafe { switch(kernel.root()) };
+        self.release(frames, kernel)
+            .expect("release live private pages");
+        assert_eq!(frames.live_count(), baseline);
+        assert_eq!(self.heap.pages, 0);
+        assert!(self.heap.frames.iter().all(Option::is_none));
+    }
+
     /// # Safety
     /// The temporary pool exclusively owns usable RAM; no main-pool frame is live.
     /// The active bootloader root retains a writable direct map of those ranges.

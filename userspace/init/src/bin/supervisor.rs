@@ -1,10 +1,14 @@
 #![no_std]
 #![no_main]
 
+#[path = "../arena.rs"]
+mod arena;
 #[path = "../channels.rs"]
 mod channels;
 #[path = "../grants.rs"]
 mod grants;
+#[path = "../heap.rs"]
+mod heap;
 #[path = "../runtime.rs"]
 mod runtime;
 use arkhe_abi::{Error, FAULT_STATUS_BASE, Syscall};
@@ -41,6 +45,22 @@ fn wait(handle: u64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(console: u64, _: u64, root: u64, factory: u64) -> ! {
+    // SAFETY: Startup has no Heap owner or references into native heap pages.
+    unsafe {
+        heap::check(console, 0x50);
+        heap::leave_allocated();
+    }
+    let heap_text = b"memory: native private heap and arena verified\n";
+    require(
+        console,
+        call(
+            Syscall::DebugWrite as u64,
+            console,
+            heap_text.as_ptr() as u64,
+            heap_text.len() as u64,
+        ) == heap_text.len() as i64,
+        "supervisor: heap check failed\n",
+    );
     channels::check(console, root, factory);
     let image = open(root, "bin/worker");
     require(console, image > 0, "supervisor: worker missing\n");

@@ -46,13 +46,31 @@ fn opened(result: i64) -> u64 {
     result as u64
 }
 
-pub fn check(console: u64, root: u64) {
+/// # Safety
+/// The startup fixture owns raw heap pages without any Heap owner or heap references.
+pub unsafe fn check(console: u64, root: u64) {
     expect(
         call(Syscall::ChannelCreate as u64, root, 0, 16),
         Error::PermissionDenied as i64,
     );
     let destination = BUFFER.0[4093].as_ptr() as u64;
     let file = opened(open(root, b"etc/motd"));
+    // SAFETY: The caller excludes Heap owners and references into removed pages.
+    let resized = unsafe { crate::runtime::resize_heap(1, 0, 0) };
+    expect(resized, arkhe_abi::PRIVATE_HEAP_BASE as i64);
+    let heap_edge = arkhe_abi::PRIVATE_HEAP_BASE + arkhe_abi::USER_PAGE_BYTES as u64 - 1;
+    // SAFETY: MemoryResize retained the first private page. No Rust heap borrow is live.
+    unsafe {
+        (heap_edge as *mut u8).write_volatile(0x5a);
+    }
+    expect(read(file, heap_edge, 2), Error::InvalidArgument as i64);
+    // SAFETY: The failed full-range preflight must preserve the mapped first byte.
+    if unsafe { (heap_edge as *const u8).read_volatile() } != 0x5a {
+        exit(12);
+    }
+    // SAFETY: Raw test pages have no Rust borrows; growth cannot invalidate other owners.
+    let resized = unsafe { crate::runtime::resize_heap(3, 0, 0) };
+    expect(resized, arkhe_abi::PRIVATE_HEAP_BASE as i64);
     for (handle, expected) in [
         (u64::MAX, Error::InvalidHandle),
         (console, Error::PermissionDenied),

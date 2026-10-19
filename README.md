@@ -22,6 +22,7 @@ Implemented:
 - legacy PC PIC/PIT timer at approximately 100 Hz;
 - RX user code, RW/NX data and stack, and unmapped stack guard pages;
 - executable-page sealing with read-only direct-map aliases and ordered reclamation;
+- private heaps with transactional growth, zeroed RW/NX pages, guards, and exit cleanup;
 - bounded USTAR initramfs with checked headers and indexed file lookup;
 - static ELF64 loading with segment, entry, bounds, and W^X validation;
 - version, console-write, close, yield, timer-tick, file-open/read, and exit calls
@@ -76,6 +77,7 @@ cargo xtask check
 cargo xtask smoke
 cargo xtask smoke-exceptions
 cargo xtask smoke-mappings
+cargo xtask smoke-memory
 cargo xtask smoke-userspace
 cargo xtask smoke-scheduler
 cargo xtask smoke-ipc
@@ -109,6 +111,15 @@ user space twice, using a missing/wrong owner, overflowing the user-root count,
 releasing the active root, and releasing the same space twice. Rejected teardown
 must preserve frame counts and code protection. Nonempty copies through a
 released user space are refused before accessing page tables.
+
+`smoke-memory` checks actual user faults on both heap guards, a released page,
+and execution from the NX heap. Every smoke boot also exhausts the shared frame
+pool, allows only two allocations during a three-page growth, and verifies
+rollback preserves the old mapping and contents. Normal and boundary programs
+exercise the heap quota, shrink/regrow zeroing, process isolation, and a Rust
+arena that lends disjoint aligned buffers. Pages intentionally left allocated
+must be reclaimed on exit and fault. File reads crossing a removed heap page
+must preserve the destination and file cursor.
 
 `smoke-userspace` verifies that user code cannot read mapped kernel memory,
 execute privileged instructions, write its RX code, execute its NX stack, or use
@@ -217,8 +228,35 @@ its cached translation. Code is therefore RX only after writable aliases are gon
 On exit or rollback, the kernel first switches away, revokes inactive execution,
 restores and invalidates the RW/NX alias, then releases the frame. Reused pages
 are zeroed before publication. PCID and global translations are disabled for this
-single-CPU contract. Runtime mapping APIs, SMP, and per-CPU TLB synchronization
-are not implemented.
+single-CPU contract. Arbitrary map/protect APIs, shared mappings, SMP, and per-CPU
+TLB synchronization are not implemented.
+
+## Private application memory
+
+`MemoryResize` sets the calling process's heap size to 0..64 pages (4 KiB each),
+returning the fixed base `0x40001000`. Reserved arguments must be zero. Each
+process owns separate physical pages at that virtual address. The lower guard
+and the page beyond the 256 KiB limit stay unmapped; pages above the current size
+are also unmapped. Growth allocates and zeros all new pages before publishing
+any mappings. Failure returns every pending lease and preserves the old heap.
+Shrink clears each leaf and invalidates its translation before releasing RAM.
+Both growth and shrink operate in the current process, on the IRQ-masked BSP.
+Heap page tables are allocated during loading and retained until process exit.
+
+The 64 heap frames are accounted separately from the 1,100-frame image/table
+limit and use the same global 4,096-frame pool. Requests above the per-process
+limit or with nonzero reserved fields return `InvalidArgument`; actual frame
+exhaustion returns `NoMemory`. A failed resize preserves existing bytes.
+Successful shrink invalidates pointers into removed pages; regrown pages are zero.
+No other process can resize this heap. Blocked processes cannot concurrently
+change their mappings, so the existing user-copy preflight remains serialized.
+
+`userspace/init/src/heap.rs` provides an exclusive scoped `Heap` owner. Its arena
+lends aligned buffers without overlap; the borrowed buffers prevent owner drop
+while in use. Individual arena buffers are reclaimed together. Raw resize is an
+unsafe userspace operation because it can invalidate Rust references. This is
+a bounded native memory example, not a Rust `std` port or a general-purpose
+global allocator.
 
 ## Filesystem
 
@@ -269,6 +307,7 @@ thread-local storage are not supported. Software floating point uses the bare Ru
 | ProcessWait | 12 | Child watcher handle, 0, 0; blocks until completion, returns status and consumes the handle |
 | ChannelCreate | 13 | Channel factory handle, writable result pointer, length exactly 16; returns 0 |
 | ProcessSpawnWithGrants | 14 | Executable file handle, argument, pointer to a 24-byte grant descriptor; returns a child watcher handle |
+| MemoryResize | 15 | Desired private heap size in pages, 0, 0; returns the heap base |
 
 File paths are relative to the granted boot namespace. Empty/absolute paths,
 `.`/`..` components, repeated separators, backslashes, and control characters
@@ -344,7 +383,8 @@ RPC reply capabilities are not implemented.
 
 Each application has a 16 KiB stack. Exit and user faults release that process’s mappings after CR3
 has switched away; the remaining runnable processes continue. The frame pool
-tracks at most 4,096 frames, with at most 1,100 owned frames per address space.
+tracks at most 4,096 frames, with at most 1,100 image/table frames and 64 heap
+frames per process.
 Reused pages are zeroed before loading. Timer ticks are a scheduling counter,
 not an accurate wall clock: interrupts can coalesce while the kernel masks IRQs.
 Kernel handlers run without preemption. Blocking calls save a user continuation

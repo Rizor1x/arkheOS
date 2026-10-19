@@ -9,6 +9,9 @@ pub const MAX_PATH_BYTES: usize = 100;
 pub const MAX_MESSAGE_BYTES: usize = 64;
 pub const CHANNEL_PAIR_BYTES: usize = 16;
 pub const SPAWN_GRANTS_BYTES: usize = 24;
+pub const USER_PAGE_BYTES: usize = 4096;
+pub const PRIVATE_HEAP_BASE: u64 = 0x4000_1000;
+pub const PRIVATE_HEAP_MAX_PAGES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
@@ -28,6 +31,9 @@ pub enum Syscall {
     ProcessWait = 12,
     ChannelCreate = 13,
     ProcessSpawnWithGrants = 14,
+    /// Set this process's private RW/NX heap size in pages; reserved arguments are zero.
+    /// Returns PRIVATE_HEAP_BASE on success, including shrink-to-zero. Growth is atomic.
+    MemoryResize = 15,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -50,6 +56,7 @@ impl TryFrom<u64> for Syscall {
             12 => Ok(Self::ProcessWait),
             13 => Ok(Self::ChannelCreate),
             14 => Ok(Self::ProcessSpawnWithGrants),
+            15 => Ok(Self::MemoryResize),
             _ => Err(Error::Unsupported),
         }
     }
@@ -178,6 +185,8 @@ mod tests {
     #[test]
     fn rejects_unknown_syscalls_without_truncation() {
         assert_eq!(Syscall::try_from(0), Ok(Syscall::Yield));
+        assert_eq!(Syscall::try_from(15), Ok(Syscall::MemoryResize));
+        assert_eq!(Syscall::try_from(16), Err(Error::Unsupported));
         assert_eq!(Syscall::try_from(u64::MAX), Err(Error::Unsupported));
         assert_eq!(Syscall::try_from(1 << 32), Err(Error::Unsupported));
     }

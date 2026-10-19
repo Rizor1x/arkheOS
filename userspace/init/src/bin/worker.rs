@@ -1,6 +1,10 @@
 #![no_std]
 #![no_main]
 
+#[path = "../arena.rs"]
+mod arena;
+#[path = "../heap.rs"]
+mod heap;
 #[path = "../runtime.rs"]
 mod runtime;
 #[path = "../service.rs"]
@@ -17,6 +21,11 @@ pub extern "C" fn _start(console: u64, argument: u64, root: u64, sender: u64, re
         exit(1);
     }
     BSS.store(argument + 1, Ordering::Relaxed);
+    // SAFETY: Startup has no Heap owner or references into native heap pages.
+    unsafe {
+        heap::check(console, argument);
+        heap::leave_allocated();
+    }
     if (0x600..0x700).contains(&argument) {
         service::run(console, argument, root, sender, receiver);
     }

@@ -1,7 +1,9 @@
 #![no_std]
 #![no_main]
 
+mod arena;
 mod files;
+mod heap;
 mod ipc;
 mod runtime;
 
@@ -32,6 +34,21 @@ pub extern "C" fn _start(console: u64, role: u64, root: u64, sender: u64, receiv
         exit(1);
     }
     BSS.store(42 + role, Ordering::Relaxed);
+    // SAFETY: Startup has no Heap owner or references into native heap pages.
+    unsafe {
+        heap::check(console, role);
+        heap::leave_allocated();
+    }
+    let heap_text = b"memory: native private heap and arena verified\n";
+    if call(
+        Syscall::DebugWrite as u64,
+        console,
+        heap_text.as_ptr() as u64,
+        heap_text.len() as u64,
+    ) != heap_text.len() as i64
+    {
+        exit(1);
+    }
     if BSS.load(Ordering::Relaxed) != 42 + role {
         exit(1);
     }
@@ -75,7 +92,10 @@ pub extern "C" fn _start(console: u64, role: u64, root: u64, sender: u64, receiv
         exit(1);
     }
     ipc::check(console, role, sender, receiver);
-    files::check(console, root);
+    // SAFETY: No Heap owner/arena survives startup; file tests may resize raw heap pages.
+    unsafe {
+        files::check(console, root);
+    }
     if env!("ARKHE_TEST_CASE") == "scheduler" {
         if role == 0 {
             loop {
@@ -100,6 +120,38 @@ pub extern "C" fn _start(console: u64, role: u64, root: u64, sender: u64, receiv
     } else {
         "boot"
     } {
+        "user-heap-lower" | "user-heap-upper" | "user-heap-freed" => {
+            let address = match env!("ARKHE_TEST_CASE") {
+                "user-heap-lower" => {
+                    arkhe_abi::PRIVATE_HEAP_BASE - arkhe_abi::USER_PAGE_BYTES as u64
+                }
+                "user-heap-upper" => {
+                    arkhe_abi::PRIVATE_HEAP_BASE
+                        + (arkhe_abi::PRIVATE_HEAP_MAX_PAGES * arkhe_abi::USER_PAGE_BYTES) as u64
+                }
+                _ => {
+                    // SAFETY: Fault testing retained raw pages, with no Rust heap borrows.
+                    if unsafe { runtime::resize_heap(0, 0, 0) }
+                        != arkhe_abi::PRIVATE_HEAP_BASE as i64
+                    {
+                        exit(1);
+                    }
+                    arkhe_abi::PRIVATE_HEAP_BASE
+                }
+            };
+            // SAFETY: Fault injection deliberately reads an unmapped heap guard/released page.
+            unsafe {
+                core::arch::asm!("mov rax, [{address}]", address = in(reg) address, out("rax") _);
+            }
+            exit(2);
+        }
+        "user-heap-exec" => {
+            let address = arkhe_abi::PRIVATE_HEAP_BASE;
+            // SAFETY: The heap is privately writable; the subsequent jump must raise NX #PF.
+            unsafe {
+                core::arch::asm!("mov byte ptr [{address}], 0xc3", "jmp {address}", address = in(reg) address, options(noreturn));
+            }
+        }
         "user-kernel-read" => {
             // SAFETY: Fault injection intentionally attempts a supervisor-only read.
             unsafe {

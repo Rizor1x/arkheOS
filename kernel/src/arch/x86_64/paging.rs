@@ -1,6 +1,8 @@
 #[path = "paging/kernel.rs"]
 pub mod kernel;
 pub use kernel::KernelSpace;
+#[path = "paging/heap.rs"]
+mod heap;
 #[cfg(feature = "smoke")]
 #[path = "paging/probes.rs"]
 mod probes;
@@ -32,6 +34,7 @@ pub enum MapError {
     InvalidState,
     WrongOwner,
     ActiveAddressSpace,
+    InvalidSize,
 }
 
 /// A reclaimable lower half bound to one retained supervisor owner.
@@ -39,6 +42,7 @@ pub enum MapError {
 pub struct UserSpace {
     tables: Tables,
     supervisor: u64,
+    heap: heap::PrivateHeap,
 }
 
 impl UserSpace {
@@ -46,6 +50,7 @@ impl UserSpace {
         Self {
             tables: Tables::new(),
             supervisor: 0,
+            heap: heap::PrivateHeap::new(),
         }
     }
 
@@ -95,6 +100,8 @@ impl UserSpace {
         if active_root() == self.tables.root {
             return Err(MapError::ActiveAddressSpace);
         }
+        self.resize_heap_inner(frames, 0)
+            .expect("inactive heap teardown");
         self.tables.release(frames, &mut kernel.tables);
         self.supervisor = 0;
         kernel.users -= 1;
@@ -144,6 +151,7 @@ struct Tables {
     direct_map: u64,
     owned: [Option<OwnedFrame>; MAX_OWNED_FRAMES],
     count: usize,
+    heap_table: u64,
 }
 
 struct OwnedFrame {
@@ -159,6 +167,7 @@ impl Tables {
             direct_map: 0,
             owned: [const { None }; MAX_OWNED_FRAMES],
             count: 0,
+            heap_table: 0,
         }
     }
 
@@ -195,6 +204,7 @@ impl Tables {
         for page in (STACK_TOP - STACK_PAGES * PAGE..STACK_TOP).step_by(PAGE as usize) {
             self.map(frames, page, true, false)?;
         }
+        self.heap_table = self.user_table(frames, arkhe_abi::PRIVATE_HEAP_BASE)?;
         Ok(())
     }
 
@@ -238,6 +248,7 @@ impl Tables {
         }
         self.count = 0;
         self.root = 0;
+        self.heap_table = 0;
     }
 
     fn allocate<const N: usize>(&mut self, frames: &mut FramePool<N>) -> Result<u64, MapError> {
@@ -372,21 +383,7 @@ impl Tables {
         if writable && executable {
             return Err(MapError::WritableCode);
         }
-        let mut table = self.root;
-        for shift in [39, 30, 21] {
-            let index = ((address >> shift) & 511) as usize;
-            let mut entry = self.read_entry(table, index)?;
-            if entry & PRESENT == 0 {
-                let frame = self.allocate(frames)?;
-                self.zero(frame)?;
-                entry = frame | PRESENT | WRITE | USER;
-                self.write_entry(table, index, entry)?;
-            }
-            if entry & HUGE != 0 {
-                return Err(MapError::UnexpectedHugePage);
-            }
-            table = entry & ADDRESS;
-        }
+        let table = self.user_table(frames, address)?;
         let index = ((address >> 12) & 511) as usize;
         if self.read_entry(table, index)? & PRESENT != 0 {
             return Err(MapError::AlreadyMapped);
@@ -402,6 +399,29 @@ impl Tables {
         // No executable translation exists while the loader can still write the frame.
         let flags = PRESENT | USER | NX | if writable { WRITE } else { 0 };
         self.write_entry(table, index, frame | flags)
+    }
+
+    fn user_table<const N: usize>(
+        &mut self,
+        frames: &mut FramePool<N>,
+        address: u64,
+    ) -> Result<u64, MapError> {
+        let mut table = self.root;
+        for shift in [39, 30, 21] {
+            let index = ((address >> shift) & 511) as usize;
+            let mut entry = self.read_entry(table, index)?;
+            if entry & PRESENT == 0 {
+                let frame = self.allocate(frames)?;
+                self.zero(frame)?;
+                entry = frame | PRESENT | WRITE | USER;
+                self.write_entry(table, index, entry)?;
+            }
+            if entry & HUGE != 0 {
+                return Err(MapError::UnexpectedHugePage);
+            }
+            table = entry & ADDRESS;
+        }
+        Ok(table)
     }
 
     fn executable_leaf(&self, owned: &OwnedFrame) -> Result<(u64, usize, u64), MapError> {

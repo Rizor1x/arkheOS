@@ -194,6 +194,14 @@ pub fn launch(
             cpu::write_console(format_args!(
                 "memory: kernel and user root ownership verified\n"
             ));
+            state.processes[0].space.check_heap_lifecycle(
+                &mut state.frames,
+                &mut state.kernel_space,
+                state.image.as_ref().expect("init image"),
+            );
+            cpu::write_console(format_args!(
+                "memory: private heap exhaustion and rollback verified\n"
+            ));
             paging::kernel::trigger_fault(memory);
             cpu::exceptions::trigger_test_fault();
         }
@@ -330,6 +338,23 @@ pub fn syscall(frame: &mut ExceptionFrame) {
         }
         Ok(Syscall::ProcessSpawn) => {
             frame.result(status(process::spawn(state, slot, a, b, c)));
+        }
+        Ok(Syscall::MemoryResize) => {
+            let result = if b != 0 || c != 0 {
+                Err(Error::InvalidArgument)
+            } else {
+                state.processes[slot]
+                    .space
+                    .resize_heap(&mut state.frames, a)
+                    .map_err(|error| {
+                        if error == paging::MapError::NoMemory {
+                            Error::NoMemory
+                        } else {
+                            Error::InvalidArgument
+                        }
+                    })
+            };
+            frame.result(status(result));
         }
         Ok(Syscall::ProcessSpawnWithGrants) => {
             frame.result(status(process::spawn_with_grants(state, slot, a, b, c)));
@@ -672,6 +697,9 @@ fn finish(state: &State) {
             "user-write-code" => "ARKHE_USER_WRITE_CODE_OK",
             "user-exec-stack" => "ARKHE_USER_EXEC_STACK_OK",
             "user-fpu" => "ARKHE_USER_FPU_OK",
+            "user-heap-lower" | "user-heap-upper" | "user-heap-freed" | "user-heap-exec" => {
+                "ARKHE_MEMORY_OK"
+            }
             _ => {
                 cpu::exit_test(0x11);
             }
@@ -687,17 +715,31 @@ pub fn fault(frame: &mut ExceptionFrame, vector: u64, error: u64, address: u64) 
     cpu::write_console(format_args!(
         "process {slot}: exception {vector}, error {error:#x}, address {address:#x}\n"
     ));
-    let expected =
-        (slot == 2 && env!("ARKHE_TEST_CASE") == "ipc-peer-fault" && vector == 6 && error == 0)
-            || slot == 0
-                && matches!(
-                    (env!("ARKHE_TEST_CASE"), vector, error),
-                    ("user-kernel-read", 14, 5)
-                        | ("user-cli", 13, 0)
-                        | ("user-write-code", 14, 7)
-                        | ("user-exec-stack", 14, 0x15)
-                        | ("user-fpu", 7, 0)
-                );
+    let heap_fault = match env!("ARKHE_TEST_CASE") {
+        "user-heap-lower" => Some((
+            arkhe_abi::PRIVATE_HEAP_BASE - arkhe_abi::USER_PAGE_BYTES as u64,
+            4,
+        )),
+        "user-heap-upper" => Some((
+            arkhe_abi::PRIVATE_HEAP_BASE
+                + (arkhe_abi::PRIVATE_HEAP_MAX_PAGES * arkhe_abi::USER_PAGE_BYTES) as u64,
+            4,
+        )),
+        "user-heap-freed" => Some((arkhe_abi::PRIVATE_HEAP_BASE, 4)),
+        "user-heap-exec" => Some((arkhe_abi::PRIVATE_HEAP_BASE, 0x15)),
+        _ => None,
+    };
+    let expected = (slot == 0 && vector == 14 && heap_fault == Some((address, error)))
+        || (slot == 2 && env!("ARKHE_TEST_CASE") == "ipc-peer-fault" && vector == 6 && error == 0)
+        || slot == 0
+            && matches!(
+                (env!("ARKHE_TEST_CASE"), vector, error),
+                ("user-kernel-read", 14, 5)
+                    | ("user-cli", 13, 0)
+                    | ("user-write-code", 14, 7)
+                    | ("user-exec-stack", 14, 0x15)
+                    | ("user-fpu", 7, 0)
+            );
     // Managed children report faults to their watcher; the supervisor chooses recovery.
     if state.processes[slot].completion.is_none() {
         if expected {

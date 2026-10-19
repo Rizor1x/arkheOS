@@ -7,6 +7,7 @@ pub mod elf;
 pub mod endpoint;
 pub mod filesystem;
 pub mod frame_pool;
+pub mod heap;
 pub mod initramfs;
 pub mod ipc;
 pub mod mapping;

@@ -399,6 +399,7 @@ pub fn trigger_test_fault() {
         | "user-exec-stack"
         | "user-code-alias"
         | "user-code-alias-switched" => return,
+        "user-heap-lower" | "user-heap-upper" | "user-heap-freed" | "user-heap-exec" => return,
         _ => panic!("unknown fault test"),
     }
     panic!("expected CPU exception was not raised");

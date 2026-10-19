@@ -30,6 +30,7 @@ jobs:
         run: |
           cargo xtask smoke
           cargo xtask smoke-mappings
+          cargo xtask smoke-memory
           cargo xtask smoke-exceptions
           cargo xtask smoke-userspace
           cargo xtask smoke-scheduler
@@ -42,6 +43,7 @@ jobs:
         run: |
           cargo xtask smoke
           cargo xtask smoke-mappings
+          cargo xtask smoke-memory
           cargo xtask smoke-exceptions
           cargo xtask smoke-userspace
           cargo xtask smoke-scheduler

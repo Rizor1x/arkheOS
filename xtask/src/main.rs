@@ -10,6 +10,7 @@ type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 const TARGET: &str = "x86_64-unknown-none";
 const MEMORY_CHECK_MARKER: &str = "memory: executable sealing rollback and reuse verified";
 const OWNERSHIP_CHECK_MARKER: &str = "memory: kernel and user root ownership verified";
+const HEAP_CHECK_MARKER: &str = "memory: private heap exhaustion and rollback verified";
 
 fn main() {
     if let Err(error) = dispatch() {
@@ -28,7 +29,7 @@ fn dispatch() -> Result {
     match task {
         "help" if args.len() <= 1 => {
             println!(
-                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|smoke-mappings|smoke-userspace|smoke-scheduler|smoke-ipc|smoke-processes|audit|hooks|doctor>"
+                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|smoke-mappings|smoke-memory|smoke-userspace|smoke-scheduler|smoke-ipc|smoke-processes|audit|hooks|doctor>"
             );
             Ok(())
         }
@@ -39,6 +40,17 @@ fn dispatch() -> Result {
         "iso" => iso(false, "boot").map(|_| ()),
         "run" => run_qemu(),
         "smoke" => smoke("boot", "ARKHE_USER_OK"),
+        "smoke-memory" => {
+            for case in [
+                "user-heap-lower",
+                "user-heap-upper",
+                "user-heap-freed",
+                "user-heap-exec",
+            ] {
+                smoke(case, "ARKHE_MEMORY_OK")?;
+            }
+            Ok(())
+        }
         "smoke-mappings" => {
             for case in [
                 "kernel-write-code",
@@ -474,6 +486,24 @@ fn smoke_output_valid(case: &str, marker: &str, text: &str) -> bool {
         && text
             .lines()
             .any(|line| line.trim() == OWNERSHIP_CHECK_MARKER)
+        && text.lines().any(|line| line.trim() == HEAP_CHECK_MARKER)
+        && (!matches!(
+            case,
+            "boot"
+                | "spawn"
+                | "user-heap-lower"
+                | "user-heap-upper"
+                | "user-heap-freed"
+                | "user-heap-exec"
+        ) || text
+            .lines()
+            .filter(|line| line.trim() == "memory: native private heap and arena verified")
+            .count()
+            == if matches!(case, "boot" | "spawn") {
+                2
+            } else {
+                6
+            })
         && text.lines().any(|line| line.trim() == marker)
         && !text.contains("PANIC:")
 }
@@ -508,14 +538,22 @@ fn doctor() -> Result {
 }
 
 #[cfg(test)]
+#[path = "../../userspace/init/src/arena.rs"]
+mod arena_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::{MEMORY_CHECK_MARKER, OWNERSHIP_CHECK_MARKER, smoke_output_valid};
+    use super::{
+        HEAP_CHECK_MARKER, MEMORY_CHECK_MARKER, OWNERSHIP_CHECK_MARKER, smoke_output_valid,
+    };
 
     #[test]
     fn process_smoke_requires_both_unwatched_child_confirmations() {
         let marker = "ARKHE_PROCESS_OK";
         let one = "service: orphan observed parent closure\r\n";
-        let memory = format!("{MEMORY_CHECK_MARKER}\r\n{OWNERSHIP_CHECK_MARKER}\r\n");
+        let memory = format!(
+            "{MEMORY_CHECK_MARKER}\r\n{OWNERSHIP_CHECK_MARKER}\r\n{HEAP_CHECK_MARKER}\r\nmemory: native private heap and arena verified\r\nmemory: native private heap and arena verified\r\n"
+        );
         assert!(!smoke_output_valid(
             "spawn",
             marker,
@@ -567,10 +605,44 @@ mod tests {
                 &format!("prefix {MEMORY_CHECK_MARKER}\n{OWNERSHIP_CHECK_MARKER}\n{marker}")
             ));
             assert!(!smoke_output_valid(case, marker, MEMORY_CHECK_MARKER));
+            assert!(!smoke_output_valid(
+                case,
+                marker,
+                &format!("{MEMORY_CHECK_MARKER}\n{OWNERSHIP_CHECK_MARKER}\n{marker}")
+            ));
             assert!(smoke_output_valid(
                 case,
                 marker,
-                &format!("{MEMORY_CHECK_MARKER}\r\n{OWNERSHIP_CHECK_MARKER}\r\n{marker}\r\n")
+                &format!(
+                    "{MEMORY_CHECK_MARKER}\r\n{OWNERSHIP_CHECK_MARKER}\r\n{HEAP_CHECK_MARKER}\r\n{marker}\r\n"
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn memory_smoke_requires_all_native_round_confirmations() {
+        let marker = "ARKHE_MEMORY_OK";
+        let prefix =
+            format!("{MEMORY_CHECK_MARKER}\n{OWNERSHIP_CHECK_MARKER}\n{HEAP_CHECK_MARKER}\n");
+        let native = "memory: native private heap and arena verified\n";
+        for case in [
+            "user-heap-lower",
+            "user-heap-upper",
+            "user-heap-freed",
+            "user-heap-exec",
+        ] {
+            for count in [0, 1, 5, 7] {
+                assert!(!smoke_output_valid(
+                    case,
+                    marker,
+                    &format!("{prefix}{}{marker}", native.repeat(count))
+                ));
+            }
+            assert!(smoke_output_valid(
+                case,
+                marker,
+                &format!("{prefix}{}{marker}", native.repeat(6))
             ));
         }
     }
