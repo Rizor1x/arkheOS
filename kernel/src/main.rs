@@ -60,7 +60,7 @@ pub extern "C" fn arkhe_boot() -> ! {
         "initramfs: {} files, indexed read-only\n",
         archive.file_count()
     ));
-    let path = if matches!(env!("ARKHE_TEST_CASE"), "boot" | "spawn") {
+    let path = if matches!(env!("ARKHE_TEST_CASE"), "boot" | "spawn" | "shared") {
         "bin/supervisor"
     } else {
         "bin/init"

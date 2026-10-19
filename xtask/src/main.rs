@@ -11,6 +11,8 @@ const TARGET: &str = "x86_64-unknown-none";
 const MEMORY_CHECK_MARKER: &str = "memory: executable sealing rollback and reuse verified";
 const OWNERSHIP_CHECK_MARKER: &str = "memory: kernel and user root ownership verified";
 const HEAP_CHECK_MARKER: &str = "memory: private heap exhaustion and rollback verified";
+const SHARED_CHECK_MARKER: &str = "memory: shared mapping leases and rollback verified";
+const SHARED_NATIVE_MARKER: &str = "memory: shared buffers, rights and lifetime verified";
 
 fn main() {
     if let Err(error) = dispatch() {
@@ -29,7 +31,7 @@ fn dispatch() -> Result {
     match task {
         "help" if args.len() <= 1 => {
             println!(
-                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|smoke-mappings|smoke-memory|smoke-userspace|smoke-scheduler|smoke-ipc|smoke-processes|audit|hooks|doctor>"
+                "cargo xtask <check|build|fetch-bootloader|iso|run|smoke|smoke-exceptions|smoke-mappings|smoke-memory|smoke-shared|smoke-userspace|smoke-scheduler|smoke-ipc|smoke-processes|audit|hooks|doctor>"
             );
             Ok(())
         }
@@ -40,6 +42,7 @@ fn dispatch() -> Result {
         "iso" => iso(false, "boot").map(|_| ()),
         "run" => run_qemu(),
         "smoke" => smoke("boot", "ARKHE_USER_OK"),
+        "smoke-shared" => smoke("shared", "ARKHE_SHARED_OK"),
         "smoke-memory" => {
             for case in [
                 "user-heap-lower",
@@ -475,7 +478,7 @@ fn smoke(case: &str, marker: &str) -> Result {
 }
 
 fn smoke_output_valid(case: &str, marker: &str, text: &str) -> bool {
-    let orphan_verified = !matches!(case, "boot" | "spawn")
+    let orphan_verified = !matches!(case, "boot" | "spawn" | "shared")
         || text
             .lines()
             .filter(|line| line.trim() == "service: orphan observed parent closure")
@@ -487,9 +490,18 @@ fn smoke_output_valid(case: &str, marker: &str, text: &str) -> bool {
             .lines()
             .any(|line| line.trim() == OWNERSHIP_CHECK_MARKER)
         && text.lines().any(|line| line.trim() == HEAP_CHECK_MARKER)
+        && text.lines().any(|line| line.trim() == SHARED_CHECK_MARKER)
+        && (!matches!(case, "boot" | "spawn" | "shared")
+            || text
+                .lines()
+                .filter(|line| line.trim() == SHARED_NATIVE_MARKER)
+                .count()
+                == 2)
+        && (case != "shared" || shared_faults_verified(text))
         && (!matches!(
             case,
             "boot"
+                | "shared"
                 | "spawn"
                 | "user-heap-lower"
                 | "user-heap-upper"
@@ -499,13 +511,28 @@ fn smoke_output_valid(case: &str, marker: &str, text: &str) -> bool {
             .lines()
             .filter(|line| line.trim() == "memory: native private heap and arena verified")
             .count()
-            == if matches!(case, "boot" | "spawn") {
+            == if matches!(case, "boot" | "spawn" | "shared") {
                 2
             } else {
                 6
             })
         && text.lines().any(|line| line.trim() == marker)
         && !text.contains("PANIC:")
+}
+
+fn shared_faults_verified(text: &str) -> bool {
+    [
+        (0x50001000u64, 7),
+        (0x50001000, 0x15),
+        (0x50000000, 4),
+        (0x50004000, 4),
+        (0x50001000, 4),
+    ]
+    .iter()
+    .all(|(address, error)| {
+        let expected = format!("process 1: exception 14, error {error:#x}, address {address:#x}");
+        text.lines().filter(|line| line.trim() == expected).count() == 2
+    })
 }
 
 fn ensure_git_root() -> Result {
@@ -544,7 +571,8 @@ mod arena_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        HEAP_CHECK_MARKER, MEMORY_CHECK_MARKER, OWNERSHIP_CHECK_MARKER, smoke_output_valid,
+        HEAP_CHECK_MARKER, MEMORY_CHECK_MARKER, OWNERSHIP_CHECK_MARKER, SHARED_CHECK_MARKER,
+        SHARED_NATIVE_MARKER, smoke_output_valid,
     };
 
     #[test]
@@ -552,7 +580,7 @@ mod tests {
         let marker = "ARKHE_PROCESS_OK";
         let one = "service: orphan observed parent closure\r\n";
         let memory = format!(
-            "{MEMORY_CHECK_MARKER}\r\n{OWNERSHIP_CHECK_MARKER}\r\n{HEAP_CHECK_MARKER}\r\nmemory: native private heap and arena verified\r\nmemory: native private heap and arena verified\r\n"
+            "{MEMORY_CHECK_MARKER}\r\n{OWNERSHIP_CHECK_MARKER}\r\n{HEAP_CHECK_MARKER}\r\n{SHARED_CHECK_MARKER}\r\n{SHARED_NATIVE_MARKER}\r\n{SHARED_NATIVE_MARKER}\r\nmemory: native private heap and arena verified\r\nmemory: native private heap and arena verified\r\n"
         );
         assert!(!smoke_output_valid(
             "spawn",
@@ -614,7 +642,7 @@ mod tests {
                 case,
                 marker,
                 &format!(
-                    "{MEMORY_CHECK_MARKER}\r\n{OWNERSHIP_CHECK_MARKER}\r\n{HEAP_CHECK_MARKER}\r\n{marker}\r\n"
+                    "{MEMORY_CHECK_MARKER}\r\n{OWNERSHIP_CHECK_MARKER}\r\n{HEAP_CHECK_MARKER}\r\n{SHARED_CHECK_MARKER}\r\n{SHARED_NATIVE_MARKER}\r\n{SHARED_NATIVE_MARKER}\r\n{marker}\r\n"
                 )
             ));
         }
@@ -623,8 +651,9 @@ mod tests {
     #[test]
     fn memory_smoke_requires_all_native_round_confirmations() {
         let marker = "ARKHE_MEMORY_OK";
-        let prefix =
-            format!("{MEMORY_CHECK_MARKER}\n{OWNERSHIP_CHECK_MARKER}\n{HEAP_CHECK_MARKER}\n");
+        let prefix = format!(
+            "{MEMORY_CHECK_MARKER}\n{OWNERSHIP_CHECK_MARKER}\n{HEAP_CHECK_MARKER}\n{SHARED_CHECK_MARKER}\n"
+        );
         let native = "memory: native private heap and arena verified\n";
         for case in [
             "user-heap-lower",
@@ -645,5 +674,47 @@ mod tests {
                 &format!("{prefix}{}{marker}", native.repeat(6))
             ));
         }
+    }
+
+    #[test]
+    fn shared_smoke_requires_leases_native_rounds_and_exact_faults() {
+        let prefix = format!(
+            "{MEMORY_CHECK_MARKER}\n{OWNERSHIP_CHECK_MARKER}\n{HEAP_CHECK_MARKER}\n{SHARED_CHECK_MARKER}\n{SHARED_NATIVE_MARKER}\n{SHARED_NATIVE_MARKER}\nmemory: native private heap and arena verified\nmemory: native private heap and arena verified\nservice: orphan observed parent closure\nservice: orphan observed parent closure\nARKHE_SHARED_OK\n"
+        );
+        let faults = [
+            (0x50001000u64, 7),
+            (0x50001000, 0x15),
+            (0x50000000, 4),
+            (0x50004000, 4),
+            (0x50001000, 4),
+        ]
+        .iter()
+        .map(|(address, error)| {
+            format!("process 1: exception 14, error {error:#x}, address {address:#x}\n").repeat(2)
+        })
+        .collect::<String>();
+        let complete = format!("{prefix}{faults}");
+        assert!(smoke_output_valid("shared", "ARKHE_SHARED_OK", &complete));
+        for missing in [
+            SHARED_CHECK_MARKER,
+            SHARED_NATIVE_MARKER,
+            "process 1: exception 14, error 0x7, address 0x50001000",
+        ] {
+            assert!(!smoke_output_valid(
+                "shared",
+                "ARKHE_SHARED_OK",
+                &complete.replacen(missing, "missing", 1)
+            ));
+        }
+        assert!(!smoke_output_valid(
+            "shared",
+            "ARKHE_SHARED_OK",
+            &format!("{complete}{faults}")
+        ));
+        assert!(!smoke_output_valid(
+            "shared",
+            "ARKHE_SHARED_OK",
+            &complete.replace("error 0x15", "error 0x5")
+        ));
     }
 }

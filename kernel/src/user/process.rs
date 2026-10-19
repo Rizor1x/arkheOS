@@ -4,6 +4,7 @@ use arkhe_abi::{Error, Handle, SPAWN_GRANTS_BYTES, SpawnGrants};
 use arkhe_kernel_core::{
     capability::{CapabilityTable, Rights},
     elf::Executable,
+    memory_object::MemoryId,
 };
 
 pub(super) fn launch_supervisor(state: &mut State) {
@@ -58,6 +59,7 @@ pub(super) fn spawn(
             console: Handle::from_raw(console),
             ..SpawnGrants::NONE
         },
+        None,
     )
 }
 
@@ -75,7 +77,35 @@ pub(super) fn spawn_with_grants(
         .copy_from_user(pointer, &mut bytes)
         .map_err(|_| Error::InvalidArgument)?;
     let grants = SpawnGrants::decode(&bytes)?;
-    create(state, parent, image, argument, grants)
+    create(state, parent, image, argument, grants, None)
+}
+
+pub(super) fn spawn_with_memory(
+    state: &mut State,
+    parent: usize,
+    image: u64,
+    argument: u64,
+    pointer: u64,
+) -> Result<u64, Error> {
+    let image = image_bytes(state, parent, image)?;
+    let mut bytes = [0; arkhe_abi::SHARED_SPAWN_BYTES];
+    state.processes[parent]
+        .space
+        .copy_from_user(pointer, &mut bytes)
+        .map_err(|_| Error::InvalidArgument)?;
+    let descriptor = arkhe_abi::SharedSpawn::decode(&bytes)?;
+    let memory = if descriptor.memory.raw() == 0 {
+        None
+    } else {
+        let Resource::Memory(id) = state.processes[parent]
+            .capabilities
+            .resolve(descriptor.memory, Rights::MAP.union(Rights::GRANT))?
+        else {
+            return Err(Error::PermissionDenied);
+        };
+        Some(id)
+    };
+    create(state, parent, image, argument, descriptor.grants, memory)
 }
 
 fn image_bytes(state: &State, parent: usize, handle: u64) -> Result<&'static [u8], Error> {
@@ -128,8 +158,32 @@ fn create(
     bytes: &'static [u8],
     argument: u64,
     grants: SpawnGrants,
+    memory: Option<MemoryId>,
 ) -> Result<u64, Error> {
     validate_grants(&state.processes[parent].capabilities, grants)?;
+    if let Some(id) = memory {
+        state.memory.retain(id)?;
+    }
+    let result = create_retained(state, parent, bytes, argument, grants, memory);
+    if result.is_err()
+        && let Some(id) = memory
+    {
+        state
+            .memory
+            .release(id, &mut state.frames)
+            .expect("unpublished memory grant");
+    }
+    result
+}
+
+fn create_retained(
+    state: &mut State,
+    parent: usize,
+    bytes: &'static [u8],
+    argument: u64,
+    grants: SpawnGrants,
+    memory: Option<MemoryId>,
+) -> Result<u64, Error> {
     let image = Executable::parse(bytes).map_err(|_| Error::BadExecutable)?;
     let slot = state.scheduler.vacant_slot().ok_or(Error::NoSpace)?;
     let completion = state.completions.create()?;
@@ -163,7 +217,7 @@ fn create(
         });
     }
     // All fallible reservations precede moves. IRQs remain masked, source handles
-    // were validated together, and the empty child table has room for all three.
+    // were validated together, and the empty child table has room for all four.
     let [console, sender, receiver] = publish_grants(state, parent, slot, grants);
     let child = &mut state.processes[slot];
     child.context = ExceptionFrame::user(
@@ -175,6 +229,13 @@ fn create(
         sender,
         receiver,
     );
+    if let Some(id) = memory {
+        let handle = child
+            .capabilities
+            .insert(Resource::Memory(id), Rights::MAP)
+            .expect("reserved child memory capability");
+        child.context.memory_grant(handle.raw());
+    }
     child.completion = Some(completion);
     child.ticks = 0;
     child.wait = None;

@@ -264,6 +264,9 @@ impl ExceptionFrame {
     pub fn result(&mut self, value: i64) {
         self.registers[14] = value as u64;
     }
+    pub fn memory_grant(&mut self, handle: u64) {
+        self.registers[6] = handle;
+    }
     pub fn is_user(&self) -> bool {
         self.code_segment & 3 == 3
     }
@@ -393,6 +396,7 @@ pub fn trigger_test_fault() {
         | "user-fpu"
         | "boot"
         | "spawn"
+        | "shared"
         | "user-kernel-read"
         | "user-cli"
         | "user-write-code"

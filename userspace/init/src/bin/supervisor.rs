@@ -11,6 +11,8 @@ mod grants;
 mod heap;
 #[path = "../runtime.rs"]
 mod runtime;
+#[path = "../shared.rs"]
+mod shared;
 use arkhe_abi::{Error, FAULT_STATUS_BASE, Syscall};
 use runtime::{call, exit};
 
@@ -70,6 +72,7 @@ pub extern "C" fn _start(console: u64, _: u64, root: u64, factory: u64) -> ! {
     check_retained_status(console, image);
     check_process_quota(console, image);
     check_descriptor_quota(console, root, image);
+    shared::check(console, root, image, factory);
     grants::check(console, root, image, factory);
     require(
         console,

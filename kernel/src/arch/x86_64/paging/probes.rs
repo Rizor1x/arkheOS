@@ -2,6 +2,81 @@ use super::{KernelSpace, MapError, NX, PAGE, UserSpace, WRITE, active_root, swit
 use arkhe_kernel_core::{elf::Executable, frame_pool::FramePool};
 
 impl UserSpace {
+    pub fn check_shared_lifecycle(
+        &mut self,
+        other: &mut Self,
+        frames: &mut FramePool<{ super::POOL_FRAMES }>,
+        kernel: &mut KernelSpace,
+        image: &Executable<'_>,
+    ) {
+        use arkhe_abi::{Error, SHARED_MEMORY_BASE};
+        let baseline = frames.live_count();
+        let mut objects = super::shared::SharedObjects::new();
+        assert_eq!(
+            self.create_shared(frames, &mut objects, 1),
+            Err(Error::InvalidArgument)
+        );
+        // SAFETY: Both vacant slots and all frame leases are exclusive to this BSP.
+        unsafe {
+            self.load(frames, kernel, image)
+                .expect("shared writer image");
+            other
+                .load(frames, kernel, image)
+                .expect("shared reader image");
+            switch(self.root());
+        }
+        let id = self
+            .create_shared(frames, &mut objects, 3)
+            .expect("shared object");
+        self.map_shared(&mut objects, id, true)
+            .expect("writer mapping");
+        self.copy_to_user(SHARED_MEMORY_BASE, b"leased")
+            .expect("writer bytes");
+        // SAFETY: The reader root retains the same supervisor mappings; IRQs stay off.
+        unsafe { switch(other.root()) };
+        assert_eq!(
+            self.map_shared(&mut objects, id, true),
+            Err(Error::InvalidArgument)
+        );
+        other
+            .map_shared(&mut objects, id, false)
+            .expect("reader mapping");
+        objects.release(id, frames).expect("close last descriptor");
+        let live = frames.live_count();
+        assert_eq!(self.release(frames, kernel), Err(MapError::InvalidState));
+        self.unmap_shared(&mut objects, frames)
+            .expect("inactive writer unmap");
+        assert_eq!(frames.live_count(), live, "reader mapping lost its frames");
+        let mut bytes = [0; 6];
+        other
+            .copy_from_user(SHARED_MEMORY_BASE, &mut bytes)
+            .expect("reader bytes");
+        assert_eq!(&bytes, b"leased");
+        assert_eq!(
+            other.copy_to_user(SHARED_MEMORY_BASE, b"bad"),
+            Err(MapError::InvalidAddress)
+        );
+        other
+            .unmap_shared(&mut objects, frames)
+            .expect("last active unmap");
+        assert_eq!(frames.live_count(), live - 3);
+        assert_eq!(objects.live_count(), 0);
+        assert_eq!(
+            other.unmap_shared(&mut objects, frames),
+            Err(MapError::InvalidState)
+        );
+        assert!(
+            other
+                .copy_from_user(SHARED_MEMORY_BASE, &mut bytes)
+                .is_err()
+        );
+        // SAFETY: Switch away before releasing the two process roots.
+        unsafe { switch(kernel.root()) };
+        self.release(frames, kernel).expect("writer teardown");
+        other.release(frames, kernel).expect("reader teardown");
+        assert_eq!(frames.live_count(), baseline);
+    }
+
     pub fn check_heap_lifecycle(
         &mut self,
         frames: &mut FramePool<{ super::POOL_FRAMES }>,
@@ -35,6 +110,17 @@ impl UserSpace {
                 .expect("test ownership");
         }
         let exhausted = frames.live_count();
+        let mut objects = super::shared::SharedObjects::new();
+        assert_eq!(
+            self.create_shared(frames, &mut objects, 3),
+            Err(arkhe_abi::Error::NoMemory)
+        );
+        assert_eq!(objects.live_count(), 0);
+        assert_eq!(
+            frames.live_count(),
+            exhausted,
+            "partial shared creation leaked"
+        );
         assert_eq!(self.resize_heap(frames, 4), Err(MapError::NoMemory));
         assert_eq!(frames.live_count(), exhausted, "partial heap growth leaked");
         assert_eq!(self.heap.pages, 1);

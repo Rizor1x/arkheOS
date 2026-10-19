@@ -6,6 +6,8 @@ mod heap;
 #[cfg(feature = "smoke")]
 #[path = "paging/probes.rs"]
 mod probes;
+#[path = "paging/shared.rs"]
+pub mod shared;
 
 use arkhe_kernel_core::elf::Executable;
 use arkhe_kernel_core::frame_pool::{Frame, FramePool};
@@ -43,6 +45,7 @@ pub struct UserSpace {
     tables: Tables,
     supervisor: u64,
     heap: heap::PrivateHeap,
+    shared: Option<shared::SharedMapping>,
 }
 
 impl UserSpace {
@@ -51,6 +54,7 @@ impl UserSpace {
             tables: Tables::new(),
             supervisor: 0,
             heap: heap::PrivateHeap::new(),
+            shared: None,
         }
     }
 
@@ -99,6 +103,9 @@ impl UserSpace {
         }
         if active_root() == self.tables.root {
             return Err(MapError::ActiveAddressSpace);
+        }
+        if self.shared.is_some() {
+            return Err(MapError::InvalidState);
         }
         self.resize_heap_inner(frames, 0)
             .expect("inactive heap teardown");
@@ -152,6 +159,7 @@ struct Tables {
     owned: [Option<OwnedFrame>; MAX_OWNED_FRAMES],
     count: usize,
     heap_table: u64,
+    shared_table: u64,
 }
 
 struct OwnedFrame {
@@ -168,6 +176,7 @@ impl Tables {
             owned: [const { None }; MAX_OWNED_FRAMES],
             count: 0,
             heap_table: 0,
+            shared_table: 0,
         }
     }
 
@@ -205,6 +214,7 @@ impl Tables {
             self.map(frames, page, true, false)?;
         }
         self.heap_table = self.user_table(frames, arkhe_abi::PRIVATE_HEAP_BASE)?;
+        self.shared_table = self.user_table(frames, arkhe_abi::SHARED_MEMORY_BASE)?;
         Ok(())
     }
 
@@ -249,6 +259,7 @@ impl Tables {
         self.count = 0;
         self.root = 0;
         self.heap_table = 0;
+        self.shared_table = 0;
     }
 
     fn allocate<const N: usize>(&mut self, frames: &mut FramePool<N>) -> Result<u64, MapError> {

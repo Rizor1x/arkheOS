@@ -12,6 +12,9 @@ pub const SPAWN_GRANTS_BYTES: usize = 24;
 pub const USER_PAGE_BYTES: usize = 4096;
 pub const PRIVATE_HEAP_BASE: u64 = 0x4000_1000;
 pub const PRIVATE_HEAP_MAX_PAGES: usize = 64;
+pub const SHARED_MEMORY_BASE: u64 = 0x5000_1000;
+pub const SHARED_MEMORY_MAX_PAGES: usize = 16;
+pub const SHARED_SPAWN_BYTES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
@@ -34,6 +37,16 @@ pub enum Syscall {
     /// Set this process's private RW/NX heap size in pages; reserved arguments are zero.
     /// Returns PRIVATE_HEAP_BASE on success, including shrink-to-zero. Growth is atomic.
     MemoryResize = 15,
+    /// Create 1..16 zeroed pages; reserved arguments are zero. Returns an object handle.
+    MemoryCreate = 16,
+    /// Map an object into this process's single shared window, mode 0=RO or 1=RW,
+    /// third argument zero. Requires MAP, plus WRITE for RW; executable maps are absent.
+    MemoryMap = 17,
+    /// Remove this process's shared window; all arguments zero. Closing an object
+    /// handle alone does not remove mappings or release their retained frames.
+    MemoryUnmap = 18,
+    /// Spawn with a SharedSpawn descriptor; copied memory authority is read-only.
+    ProcessSpawnWithMemory = 19,
 }
 
 impl TryFrom<u64> for Syscall {
@@ -57,6 +70,10 @@ impl TryFrom<u64> for Syscall {
             13 => Ok(Self::ChannelCreate),
             14 => Ok(Self::ProcessSpawnWithGrants),
             15 => Ok(Self::MemoryResize),
+            16 => Ok(Self::MemoryCreate),
+            17 => Ok(Self::MemoryMap),
+            18 => Ok(Self::MemoryUnmap),
+            19 => Ok(Self::ProcessSpawnWithMemory),
             _ => Err(Error::Unsupported),
         }
     }
@@ -154,6 +171,32 @@ impl SpawnGrants {
     }
 }
 
+/// Spawn grants followed by one memory handle. The memory capability is copied
+/// with MAP only; the child receives it in R9. Zero omits the memory grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedSpawn {
+    pub grants: SpawnGrants,
+    pub memory: Handle,
+}
+
+impl SharedSpawn {
+    pub fn encode(self) -> [u8; SHARED_SPAWN_BYTES] {
+        let mut bytes = [0; SHARED_SPAWN_BYTES];
+        bytes[..24].copy_from_slice(&self.grants.encode());
+        bytes[24..].copy_from_slice(&self.memory.raw().to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let bytes: &[u8; SHARED_SPAWN_BYTES] =
+            bytes.try_into().map_err(|_| Error::InvalidArgument)?;
+        Ok(Self {
+            grants: SpawnGrants::decode(&bytes[..24])?,
+            memory: Handle::from_raw(u64::from_le_bytes(bytes.as_chunks::<8>().0[3])),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Message {
     bytes: [u8; MAX_MESSAGE_BYTES],
@@ -183,10 +226,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_spawn_requires_exact_length_and_preserves_grant_order() {
+        let descriptor = SharedSpawn {
+            grants: SpawnGrants::NONE,
+            memory: Handle::from_raw(0x0102_0304_0506_0708),
+        };
+        let bytes = descriptor.encode();
+        assert_eq!(&bytes[24..], &[8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(SharedSpawn::decode(&bytes), Ok(descriptor));
+        for len in 0..SHARED_SPAWN_BYTES {
+            assert_eq!(
+                SharedSpawn::decode(&bytes[..len]),
+                Err(Error::InvalidArgument)
+            );
+        }
+        let mut unaligned = [0; SHARED_SPAWN_BYTES + 1];
+        unaligned[1..].copy_from_slice(&bytes);
+        assert_eq!(SharedSpawn::decode(&unaligned[1..]), Ok(descriptor));
+        assert_eq!(SharedSpawn::decode(&unaligned), Err(Error::InvalidArgument));
+    }
+
+    #[test]
     fn rejects_unknown_syscalls_without_truncation() {
         assert_eq!(Syscall::try_from(0), Ok(Syscall::Yield));
         assert_eq!(Syscall::try_from(15), Ok(Syscall::MemoryResize));
-        assert_eq!(Syscall::try_from(16), Err(Error::Unsupported));
+        assert_eq!(Syscall::try_from(19), Ok(Syscall::ProcessSpawnWithMemory));
+        assert_eq!(Syscall::try_from(20), Err(Error::Unsupported));
         assert_eq!(Syscall::try_from(u64::MAX), Err(Error::Unsupported));
         assert_eq!(Syscall::try_from(1 << 32), Err(Error::Unsupported));
     }

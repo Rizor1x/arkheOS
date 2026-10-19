@@ -23,6 +23,7 @@ Implemented:
 - RX user code, RW/NX data and stack, and unmapped stack guard pages;
 - executable-page sealing with read-only direct-map aliases and ordered reclamation;
 - private heaps with transactional growth, zeroed RW/NX pages, guards, and exit cleanup;
+- shared memory objects with separate mapping leases and read-only child grants;
 - bounded USTAR initramfs with checked headers and indexed file lookup;
 - static ELF64 loading with segment, entry, bounds, and W^X validation;
 - version, console-write, close, yield, timer-tick, file-open/read, and exit calls
@@ -34,8 +35,8 @@ Implemented:
 
 Execution uses one CPU with at most four live processes. Process roots share
 the kernel-owned supervisor mappings; APIC and SMP are not implemented. Children
-receive only an explicitly granted console and channel sides, without namespace,
-channel-creation, or process-creation authority. Persistent storage,
+receive only an explicitly granted console, channel sides, and optional read-only
+memory, without namespace, channel-creation, or process-creation authority. Persistent storage,
 Rust `std`, Python, and a desktop are not supported yet. The kernel is
 experimental and is not ready for everyday use.
 
@@ -78,6 +79,7 @@ cargo xtask smoke
 cargo xtask smoke-exceptions
 cargo xtask smoke-mappings
 cargo xtask smoke-memory
+cargo xtask smoke-shared
 cargo xtask smoke-userspace
 cargo xtask smoke-scheduler
 cargo xtask smoke-ipc
@@ -120,6 +122,12 @@ exercise the heap quota, shrink/regrow zeroing, process isolation, and a Rust
 arena that lends disjoint aligned buffers. Pages intentionally left allocated
 must be reclaimed on exit and fault. File reads crossing a removed heap page
 must preserve the destination and file cursor.
+
+`smoke-shared` runs the supervisor's writer/reader exchange and checks the exact
+page-fault address and flags for writes to a read-only mapping, execution from
+shared data, both guards, and access after unmap. Each boot also checks two
+simultaneous mappings after the last handle closes, last-mapping reclamation,
+and partial allocation rollback under real frame-pool exhaustion.
 
 `smoke-userspace` verifies that user code cannot read mapped kernel memory,
 execute privileged instructions, write its RX code, execute its NX stack, or use
@@ -228,7 +236,7 @@ its cached translation. Code is therefore RX only after writable aliases are gon
 On exit or rollback, the kernel first switches away, revokes inactive execution,
 restores and invalidates the RW/NX alias, then releases the frame. Reused pages
 are zeroed before publication. PCID and global translations are disabled for this
-single-CPU contract. Arbitrary map/protect APIs, shared mappings, SMP, and per-CPU
+single-CPU contract. Arbitrary map/protect APIs, SMP, and per-CPU
 TLB synchronization are not implemented.
 
 ## Private application memory
@@ -258,6 +266,36 @@ unsafe userspace operation because it can invalidate Rust references. This is
 a bounded native memory example, not a Rust `std` port or a general-purpose
 global allocator.
 
+## Shared application memory
+
+`MemoryCreate` allocates a zeroed object of 1..16 pages and returns a local handle
+with MAP, WRITE, and GRANT rights. There are four global object slots, using the
+same frame pool as other allocations. These are experimental global quotas;
+per-application reservations and fairness are not implemented.
+
+`MemoryMap` maps the whole object at `0x50001000`, read-only or read/write as its
+rights allow. Each process has one shared window, with unmapped boundaries;
+all shared mappings are NX. Its page table is retained until process teardown.
+`MemoryUnmap` removes the caller's mapping and invalidates translations before
+returning its lease. Closing a handle leaves existing mappings usable. Frames
+are freed only after all handles and mappings are gone, including exit/fault
+cleanup. Allocation and failed spawn roll back unpublished references.
+
+`ProcessSpawnWithMemory` accepts a 32-byte descriptor: the three existing spawn
+grant handles followed by a memory handle, all little-endian u64. Channel sides
+still move; memory authority is copied with MAP only into child entry R9.
+The child cannot write through that grant or delegate it further. Zero omits it;
+older spawn calls always set R9 to zero. No namespace or factory is inherited.
+
+Read-only access does not make shared contents immutable: the creator may retain
+a writable mapping. Shared bytes are untrusted and must be copied or accessed
+through a protocol that defines publication and ownership. The native example
+publishes data before spawning, reads through raw byte accesses without creating
+shared Rust references, and returns a checksum over IPC. A separate case retains
+the reader after the writer unmaps and closes its handle. Volatile access alone
+is not thread synchronization. General handle transfer, remote revocation,
+immutable sealing, DMA pinning, shared queues, and SMP are not implemented.
+
 ## Filesystem
 
 The current filesystem is a read-only USTAR initramfs supplied by Limine. It contains
@@ -280,8 +318,8 @@ in RSI, and a namespace handle in RDX. The boot supervisor receives its channel
 factory handle in RCX and zero in R8. Boundary tests instead receive an outgoing
 channel in RCX and an incoming channel in R8, with role numbers in RSI.
 Spawned children receive the optional console and argument, a moved sender in
-RCX, and a moved receiver in R8; RDX is zero. Absent grants are zero. The original
-ProcessSpawn call supplies no channel sides. `userspace/init` provides complete
+RCX, a moved receiver in R8, and optional read-only memory in R9; RDX is zero.
+Absent grants are zero. The original ProcessSpawn call supplies no channel sides. `userspace/init` provides complete
 build and syscall examples.
 The ABI is experimental.
 
@@ -308,6 +346,10 @@ thread-local storage are not supported. Software floating point uses the bare Ru
 | ChannelCreate | 13 | Channel factory handle, writable result pointer, length exactly 16; returns 0 |
 | ProcessSpawnWithGrants | 14 | Executable file handle, argument, pointer to a 24-byte grant descriptor; returns a child watcher handle |
 | MemoryResize | 15 | Desired private heap size in pages, 0, 0; returns the heap base |
+| MemoryCreate | 16 | Page count 1..16, 0, 0; returns a memory object handle |
+| MemoryMap | 17 | Memory handle, mode 0=RO or 1=RW, 0; returns the shared-window base |
+| MemoryUnmap | 18 | 0, 0, 0; removes the caller's shared mapping and returns 0 |
+| ProcessSpawnWithMemory | 19 | Executable file handle, argument, pointer to a 32-byte SharedSpawn descriptor; returns a child watcher |
 
 File paths are relative to the granted boot namespace. Empty/absolute paths,
 `.`/`..` components, repeated separators, backslashes, and control characters

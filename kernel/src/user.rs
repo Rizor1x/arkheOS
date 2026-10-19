@@ -1,4 +1,5 @@
 mod ipc;
+mod memory;
 mod process;
 
 use core::cell::UnsafeCell;
@@ -33,6 +34,7 @@ enum Resource {
     Sender(EndpointId),
     Receiver(EndpointId),
     ChannelFactory,
+    Memory(arkhe_kernel_core::memory_object::MemoryId),
 }
 const BOOT_PROCESSES: usize = 3;
 const PROCESSES: usize = 4;
@@ -80,6 +82,7 @@ struct State {
     scheduler: Scheduler<PROCESSES>,
     endpoints: Endpoints<BOOT_PROCESSES, 4>,
     completions: Completions<8>,
+    memory: paging::shared::SharedObjects,
     spawned: usize,
     blocks: u64,
     wakes: u64,
@@ -105,6 +108,7 @@ static STATE: ProcessStorage = ProcessStorage(UnsafeCell::new(State {
     scheduler: Scheduler::new(),
     endpoints: Endpoints::new(),
     completions: Completions::new(),
+    memory: paging::shared::SharedObjects::new(),
     spawned: 0,
     blocks: 0,
     wakes: 0,
@@ -202,6 +206,19 @@ pub fn launch(
             cpu::write_console(format_args!(
                 "memory: private heap exhaustion and rollback verified\n"
             ));
+            let [writer, reader] = state
+                .processes
+                .get_disjoint_mut([0, 1])
+                .expect("distinct probe slots");
+            writer.space.check_shared_lifecycle(
+                &mut reader.space,
+                &mut state.frames,
+                &mut state.kernel_space,
+                state.image.as_ref().expect("probe image"),
+            );
+            cpu::write_console(format_args!(
+                "memory: shared mapping leases and rollback verified\n"
+            ));
             paging::kernel::trigger_fault(memory);
             cpu::exceptions::trigger_test_fault();
         }
@@ -268,6 +285,7 @@ fn spawn_round(state: &mut State) {
     );
     assert_eq!(state.endpoints.live_count(), 0, "endpoint leak");
     assert_eq!(state.completions.live_count(), 0, "completion leak");
+    assert_eq!(state.memory.live_count(), 0, "memory object leak");
     if supervised() {
         process::launch_supervisor(state);
         state.round += 1;
@@ -358,6 +376,18 @@ pub fn syscall(frame: &mut ExceptionFrame) {
         }
         Ok(Syscall::ProcessSpawnWithGrants) => {
             frame.result(status(process::spawn_with_grants(state, slot, a, b, c)));
+        }
+        Ok(Syscall::ProcessSpawnWithMemory) => {
+            frame.result(status(process::spawn_with_memory(state, slot, a, b, c)));
+        }
+        Ok(Syscall::MemoryCreate) => {
+            frame.result(status(memory::create(state, slot, a, b, c)));
+        }
+        Ok(Syscall::MemoryMap) => {
+            frame.result(status(memory::map(state, slot, a, b, c)));
+        }
+        Ok(Syscall::MemoryUnmap) => {
+            frame.result(status(memory::unmap(state, slot, a, b, c)));
         }
         Ok(Syscall::ChannelCreate) => {
             frame.result(status(ipc::create(state, slot, a, b, c)));
@@ -542,6 +572,12 @@ fn retire(state: &mut State, frame: &mut ExceptionFrame, outcome: u64) {
     unsafe {
         paging::switch(root);
     }
+    if state.processes[slot].space.has_shared_mapping() {
+        state.processes[slot]
+            .space
+            .unmap_shared(&mut state.memory, &mut state.frames)
+            .expect("inactive shared teardown");
+    }
     state.processes[slot]
         .space
         .release(&mut state.frames, &mut state.kernel_space)
@@ -551,6 +587,7 @@ fn retire(state: &mut State, frame: &mut ExceptionFrame, outcome: u64) {
         assert_eq!(state.kernel_space.user_roots(), 0, "user root leak");
         assert_eq!(state.endpoints.live_count(), 0, "endpoint leak");
         assert_eq!(state.completions.live_count(), 0, "completion leak");
+        assert_eq!(state.memory.live_count(), 0, "memory object leak");
         assert_eq!(
             state.frames.live_count(),
             state.kernel_space.table_frames(),
@@ -668,7 +705,10 @@ fn finish(state: &State) {
     #[cfg(feature = "smoke")]
     {
         let case = env!("ARKHE_TEST_CASE");
-        let expected = if matches!(case, "boot" | "spawn" | "scheduler" | "idle" | "ipc") {
+        let expected = if matches!(
+            case,
+            "boot" | "spawn" | "shared" | "scheduler" | "idle" | "ipc"
+        ) {
             0
         } else {
             ROUNDS as usize
@@ -689,6 +729,7 @@ fn finish(state: &State) {
         let marker = match case {
             "boot" => "ARKHE_USER_OK",
             "spawn" => "ARKHE_PROCESS_OK",
+            "shared" => "ARKHE_SHARED_OK",
             "ipc" => "ARKHE_IPC_OK",
             "ipc-peer-fault" => "ARKHE_IPC_PEER_FAULT_OK",
             "scheduler" if state.preemptions >= 16 => "ARKHE_SCHEDULER_OK",
@@ -752,11 +793,17 @@ pub fn fault(frame: &mut ExceptionFrame, vector: u64, error: u64, address: u64) 
 }
 
 fn supervised() -> bool {
-    matches!(env!("ARKHE_TEST_CASE"), "boot" | "spawn")
+    matches!(env!("ARKHE_TEST_CASE"), "boot" | "spawn" | "shared")
 }
 
 fn release(state: &mut State, resource: Resource) -> bool {
-    if let Resource::Child(id) = resource {
+    if let Resource::Memory(id) = resource {
+        state
+            .memory
+            .release(id, &mut state.frames)
+            .expect("owned memory capability");
+        false
+    } else if let Resource::Child(id) = resource {
         state.completions.detach(id).expect("owned child watcher");
         false
     } else {

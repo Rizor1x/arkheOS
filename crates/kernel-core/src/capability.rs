@@ -3,7 +3,7 @@ use arkhe_abi::{Error, Handle};
 const MAX_GENERATION: u32 = i32::MAX as u32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Rights(u8);
+pub struct Rights(u16);
 
 impl Rights {
     pub const SEND: Self = Self(1);
@@ -14,6 +14,9 @@ impl Rights {
     pub const SPAWN: Self = Self(32);
     pub const WAIT: Self = Self(64);
     pub const CREATE: Self = Self(128);
+    pub const MAP: Self = Self(256);
+    pub const WRITE: Self = Self(512);
+    pub const GRANT: Self = Self(1024);
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)

@@ -20,6 +20,7 @@ fn main() {
             | "user-heap-exec"
             | "boot"
             | "spawn"
+            | "shared"
             | "ipc"
             | "ipc-peer-fault"
             | "scheduler"
